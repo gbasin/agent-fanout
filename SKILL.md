@@ -1,37 +1,58 @@
 ---
-name: codex-fanout
-description: Delegate implementation work to parallel codex CLI subagents in persistent git worktrees, with Claude as orchestrator (plan, review, merge, final QA). Use when the user asks to delegate to codex, fan out work to codex subagents, or parallelize implementation across cheaper agents. Includes the recipe for codex doing its own visual QA via dev-browser.
+name: agent-fanout
+description: Delegate implementation work to parallel headless agent-CLI subagents (codex by default; omp with a cheap model like Gemini Flash as an alternative) in persistent git worktrees, with Claude as orchestrator (plan, review, merge, final QA). Use when the user asks to delegate to codex or omp, fan out work to subagents, or parallelize implementation across cheaper agents. Includes the recipe for subagents doing their own visual QA via dev-browser.
 ---
 
-# Codex fan-out delegation
+# Agent fan-out delegation
 
 Claude is the orchestrator: decompose, write precise briefs, review every diff,
-merge, and own final verification. Codex implements. It is cheaper and faster,
-not smarter — never merge its work unreviewed.
+merge, and own final verification. Headless agent CLIs implement. They are
+cheaper and faster, not smarter — never merge their work unreviewed.
+
+## Runners
+
+Any agent CLI qualifies as a runner if it (a) runs headless and **exits when
+the task is done** (completion = process exit, which fires the Bash background
+notification automatically), (b) operates on the current working directory,
+and (c) follows a "do not commit" instruction. Pick per phase; mixed fleets
+are fine.
+
+| Runner | Launch core | Best for | Sandbox |
+|---|---|---|---|
+| **codex** (default) | `codex exec --sandbox workspace-write ...` | substantial phases needing judgment | macOS seatbelt; reads everywhere, writes workspace+/tmp |
+| **omp** (oh-my-pi) | `omp -p --no-session --auto-approve --model gemini-3.5-flash ...` | mechanical/template phases, high-volume cheap work | **none** — full user permissions |
+
+Runner notes:
+- **codex**: ALWAYS pass `--sandbox workspace-write` explicitly — the global
+  `~/.codex/config.toml` may set `danger-full-access`, and a bare `codex exec`
+  would run unsandboxed. Knobs: `-m <model>`, `-c model_reasoning_effort="high"`.
+- **omp**: `--auto-approve` means it can touch anything the user can; the
+  worktree is discipline, not containment — keep briefs tightly scoped.
+  Model is fuzzy-matched (`--model gemini-3.5-flash`, `--model flash`);
+  `--thinking low|medium|high` trades speed for depth. Needs one-time auth
+  (`omp` then `/login`, or a provider key like `GEMINI_API_KEY` in env) —
+  headless runs fail fast with "Use /login, set an API key..." if missing.
+  Briefs attach via `@/path/to/brief.md`; capture stdout as the result.
 
 ## Hard-won architecture rules
 
-1. **Never combine the Agent tool's `isolation: worktree` with codex.** The
-   codex-rescue launcher starts the task async and exits in ~60s; the harness
-   then reaps the "unchanged" worktree, orphaning the still-running codex task
+1. **Never combine the Agent tool's `isolation: worktree` with an async
+   runner.** If the launching subagent exits before the runner finishes, the
+   harness reaps the "unchanged" worktree and orphans the still-running task
    in a deleted directory. Create persistent worktrees manually (below).
-2. **Use `codex exec` directly, not `codex-companion.mjs` background tasks,
-   for fan-out.** Companion job state is keyed per-cwd: status checks from any
-   other directory return "No job found", which grep-based watchers misread as
-   "finished". `codex exec` completion = process exit = automatic Bash
-   task notification. No polling loops, no false positives.
-3. **Always pass `--sandbox workspace-write` explicitly.** The global
-   `~/.codex/config.toml` may set `sandbox_mode = "danger-full-access"`; a bare
-   `codex exec` would then run unsandboxed.
-4. **Codex CAN do visual QA** (verified 2026-06-12), but only if BOTH hold:
-   - the dev-browser daemon was pre-started from outside the sandbox
-     (daemon auto-start inside seatbelt always fails at Mach-port registration,
-     and the task may then wedge for hours retrying fallbacks);
-   - codex runs with `-c 'sandbox_workspace_write.network_access=true'`
-     (otherwise the connect to `~/.dev-browser/daemon.sock` is blocked and
-     dev-browser reports "Daemon failed to start within 5 seconds").
-   Screenshot writes happen daemon-side into `~/.dev-browser/tmp/`, which codex
-   can read and view as images — so it can check its own work visually.
+2. **Launch runners directly via backgrounded Bash; completion = process
+   exit.** No status-polling watcher loops. (History: codex-companion
+   background jobs key their state per-cwd, so `status` from any other
+   directory says "No job found" — which grep watchers misread as "finished".)
+3. **Visual QA from inside a runner works, with preconditions.** Pre-start the
+   dev-browser daemon from the orchestrator before launching (avoids
+   concurrent auto-start races; and under codex's seatbelt, daemon auto-start
+   is impossible — Chrome dies at Mach-port registration, and the task may
+   wedge for hours retrying fallbacks). codex additionally needs
+   `-c 'sandbox_workspace_write.network_access=true'` or the connect to
+   `~/.dev-browser/daemon.sock` is blocked ("Daemon failed to start within 5
+   seconds"). Screenshot writes happen daemon-side into `~/.dev-browser/tmp/`,
+   readable by all runners — they can view the PNGs and check their own work.
 
 ## Procedure
 
@@ -42,6 +63,8 @@ not smarter — never merge its work unreviewed.
 - Give parallel phases **disjoint ownership**: each owns specific files or
   specific functions. Additions to shared files go in a clearly marked
   appendix block (`# === <phase> additions ===`) to keep merges trivial.
+- Assign runners by difficulty: codex for phases needing judgment, omp+flash
+  for mechanical ones.
 
 ### 1. Pre-flight (orchestrator, main repo)
 ```bash
@@ -49,10 +72,10 @@ not smarter — never merge its work unreviewed.
 grep -qx '.claude/worktrees/' .git/info/exclude 2>/dev/null \
   || echo '.claude/worktrees/' >> .git/info/exclude
 
-# if any phase needs visual QA: warm the daemon OUTSIDE the sandbox
+# if any phase needs visual QA: warm the daemon OUTSIDE any sandbox
 dev-browser <<< 'console.log("daemon warm")'
 ```
-Start from a clean, committed state — codex diffs are reviewed against HEAD.
+Start from a clean, committed state — runner diffs are reviewed against HEAD.
 
 ### 2. Persistent worktrees (one per parallel phase)
 ```bash
@@ -93,6 +116,7 @@ known gaps.
 ```
 
 ### 4. Launch (one backgrounded Bash call per phase)
+codex:
 ```bash
 cd <abs worktree path> && codex exec \
   --sandbox workspace-write \
@@ -100,15 +124,20 @@ cd <abs worktree path> && codex exec \
   -o /tmp/<phase>-result.md \
   "$(cat /tmp/<phase>-brief.md)"
 ```
+omp (e.g. Gemini Flash):
+```bash
+cd <abs worktree path> && omp -p --no-session --auto-approve \
+  --model gemini-3.5-flash \
+  @/tmp/<phase>-brief.md > /tmp/<phase>-result.md
+```
 Run with `run_in_background: true`. The completion notification fires when the
-process exits — do not write watcher loops. Knobs for hard phases:
-`-m <model>`, `-c model_reasoning_effort="high"`.
+process exits — do not write watcher loops.
 
 ### 5. Monitor (only when prompted or suspicious)
 Tail the Bash output file. If no new output for ~10 minutes, check
-`git -C <worktree> diff --stat` — codex sometimes wedges AFTER the work is
-done (the Phase-1 failure mode). If the diff looks complete, kill the process
-and salvage the tree; the work is rarely lost.
+`git -C <worktree> diff --stat` — runners sometimes wedge AFTER the work is
+done. If the diff looks complete, kill the process and salvage the tree; the
+work is rarely lost.
 
 ### 6. Review and merge (orchestrator)
 ```bash
@@ -119,9 +148,9 @@ git apply --3way /tmp/<phase>.patch
 Re-run build/tests on main after each apply. Overlapping hunks across phases
 mean the ownership split failed — resolve manually, don't re-delegate.
 
-### 7. Final QA — yours, not codex's
-Codex screenshots are a first-line filter. Before committing, re-verify the key
-surfaces yourself (desktop + mobile widths at minimum). Then commit and:
+### 7. Final QA — yours, not the runners'
+Runner screenshots are a first-line filter. Before committing, re-verify the
+key surfaces yourself (desktop + mobile widths at minimum). Then commit and:
 ```bash
 git worktree remove .claude/worktrees/<phase> --force
 git branch -D wt-<phase>
@@ -133,7 +162,9 @@ git branch -D wt-<phase>
 |---|---|---|
 | codex: "Daemon failed to start within 5 seconds" | daemon not pre-warmed, or `network_access` not set | warm daemon from orchestrator; relaunch with the `-c` flag |
 | codex stuck retrying browser fallbacks (node_repl, NODE_PATH, --connect) | same as above | same; salvage any completed diff first |
-| worktree vanished mid-task | it was harness-managed (Agent isolation) | kill orphans (`pkill -f app-server-broker` for that cwd may need escalation), recreate persistent worktree, relaunch |
+| omp: "Use /login, set an API key environment variable..." | no stored credentials and no provider key in env | one-time `omp` + `/login`, or export the provider key; then relaunch |
+| omp touched files outside its scope | no sandbox + loose brief | tighten SCOPE wording; review patch hunks before apply (you do this anyway) |
+| worktree vanished mid-task | it was harness-managed (Agent isolation) | kill orphans, recreate persistent worktree, relaunch |
 | companion `status`: "No job found" | per-cwd state; checked from wrong dir | `cd` to the exact launch dir; never treat as completion |
 | task "running" for an hour with frozen progress tail but full diff present | end-of-run wedge | kill, salvage tree, do verification yourself |
 | stray gitlinks in a commit | `.claude/worktrees/` not excluded | pre-flight exclude line; fix commit with `git rm --cached` |
