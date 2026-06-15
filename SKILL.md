@@ -82,6 +82,43 @@ Start from a clean, committed state — runner diffs are reviewed against HEAD.
 git worktree add .claude/worktrees/<phase> -b wt-<phase>
 ```
 
+**Warm the worktree with gitignored inputs.** A fresh worktree contains zero
+gitignored files, so the runner has no `node_modules`, no `.env`, no generated
+sources — the #1 cause of a runner wedging (`tsc: command not found`, missing
+deps). Provide them *before launch*: the runner can't install them itself
+(codex's seatbelt can't write the global package store). List what's
+gitignored-but-present and classify it — the needed set is repo-specific, so
+read it; don't assume just `node_modules`:
+```bash
+git ls-files -o -i --exclude-standard --directory   # gitignored & present
+```
+- **Clone the INPUTS** the toolchain reads: dependency dirs (`node_modules`,
+  `.venv`, `vendor`, `Pods`), env/secret files (`.env*`, token-bearing
+  `.npmrc`, service-account JSON), and gitignored-but-generated sources the
+  build needs (codegen output, `expo-env.d.ts`, generated native projects).
+- **Skip the OUTPUTS/ephemera**: `dist/`, `.next/`, build caches,
+  `__pycache__`, logs, test artifacts, `.DS_Store` — and NEVER
+  `.claude/worktrees/` (cloning it into a worktree recurses).
+
+Clone copy-on-write so each worktree gets its own *writable* deps (the runner
+can install a missing one without corrupting the source or sibling worktrees)
+at near-zero disk on APFS/btrfs:
+```bash
+WT=.claude/worktrees/<phase>
+warm() {  # warm <relpath-from-repo-root>
+  local rel=$1 src=$PWD/$rel dst=$WT/$rel
+  [ -e "$src" ] || return 0
+  mkdir -p "$(dirname "$dst")"
+  cp -cR "$src" "$dst" 2>/dev/null \                   # macOS APFS clonefile (CoW)
+    || cp -a --reflink=auto "$src" "$dst" 2>/dev/null \ # Linux btrfs/xfs reflink
+    || ln -s "$src" "$dst"                             # last resort: shared read-only symlink
+}
+warm node_modules; warm surface/web/node_modules; warm .env   # the classified inputs
+```
+`cp -c` / `--reflink=auto` self-fall-back to a *full* copy off-APFS or
+cross-volume; for a huge dep dir on another volume, `ln -s` it instead
+(shared, read-only — the runner then can't self-install into it).
+
 ### 3. Briefs
 Write each brief to `/tmp/<phase>-brief.md` (avoids shell quoting issues).
 Template:
@@ -97,6 +134,11 @@ SCOPE — you own ONLY: <files / functions>. Additions to shared files go in an
 appendix block marked `# === <phase> additions ===`. Touch nothing else.
 
 Do NOT commit. The orchestrator reviews and merges your working-tree diff.
+
+Your deps are a copy-on-write clone of the orchestrator's — installing a
+missing one is fine and affects no one else. But if the toolchain is absent or
+an install fails, do NOT loop on it: skip the test step, say so in your report,
+and finish. The orchestrator re-verifies on main regardless.
 
 TEST PROCEDURE (run before reporting):
 <exact build/test commands>
@@ -164,6 +206,7 @@ git branch -D wt-<phase>
 | codex stuck retrying browser fallbacks (node_repl, NODE_PATH, --connect) | same as above | same; salvage any completed diff first |
 | omp: "Use /login, set an API key environment variable..." | no stored credentials and no provider key in env | one-time `omp` + `/login`, or export the provider key; then relaunch |
 | omp touched files outside its scope | no sandbox + loose brief | tighten SCOPE wording; review patch hunks before apply (you do this anyway) |
+| runner wedges on `command not found` / missing `node_modules` | fresh worktree has no gitignored deps | warm the worktree (Step 2) before launch; brief skips-not-retries if deps absent |
 | worktree vanished mid-task | it was harness-managed (Agent isolation) | kill orphans, recreate persistent worktree, relaunch |
 | companion `status`: "No job found" | per-cwd state; checked from wrong dir | `cd` to the exact launch dir; never treat as completion |
 | task "running" for an hour with frozen progress tail but full diff present | end-of-run wedge | kill, salvage tree, do verification yourself |
