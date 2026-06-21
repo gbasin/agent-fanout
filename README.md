@@ -12,11 +12,12 @@ npx skills add gbasin/agent-fanout --all -g
 
 The runners do the volume work — cheaper and faster, reviewed before anything lands. The skill encodes the working recipe for orchestrating them:
 
-1. **Foundation first** — if the work needs shared conventions, run one task, review, commit, then fan out
-2. **Disjoint ownership** — each parallel phase owns specific files or functions; shared-file additions go in marked appendix blocks so merges stay trivial
-3. **Persistent worktrees, launched directly** — completion is process exit, so the background-task notification doubles as the "done" signal; no status-polling watcher loops
-4. **Patch-based review and merge** — read every diff, `git apply --3way`, re-test after each apply
-5. **Final QA belongs to the orchestrator** — runner screenshots are a first-line filter, not a sign-off
+1. **The orchestrator runs in its own integration worktree** — never the primary checkout, so several orchestrators can fan out on one machine/repo at once; every branch, path, and `/tmp` artifact is session-namespaced, and main is touched only by the final atomic merge/PR
+2. **Foundation first** — if the work needs shared conventions, run one task, review, commit, then fan out
+3. **Disjoint ownership** — each parallel phase owns specific files or functions; shared-file additions go in marked appendix blocks so merges stay trivial
+4. **Persistent worktrees, launched directly** — completion is process exit, so the background-task notification doubles as the "done" signal; no status-polling watcher loops
+5. **Patch-based review and merge** — read every diff, `git apply --3way`, re-test after each apply
+6. **Final QA belongs to the orchestrator** — runner screenshots are a first-line filter, not a sign-off; then land the integration branch (PR if the repo has a remote, else local merge)
 
 Mixed fleets are fine: codex for phases needing judgment, omp + Gemini Flash for mechanical ones. Any agent CLI that runs headless, exits on completion, and works against the current directory can slot in.
 
