@@ -25,7 +25,12 @@ are fine.
 Runner notes:
 - **codex**: ALWAYS pass `--sandbox workspace-write` explicitly — the global
   `~/.codex/config.toml` may set `danger-full-access`, and a bare `codex exec`
-  would run unsandboxed. Knobs: `-m <model>`, `-c model_reasoning_effort="high"`.
+  would run unsandboxed. ALSO ALWAYS pass
+  `-c 'features.default_mode_request_user_input=false'` — if the global config
+  enables that under-dev feature, a headless lane that decides to ask a
+  clarifying question blocks forever on stdin (no one answers), showing up as a
+  task that "runs" for many minutes with zero output and zero diff. Knobs:
+  `-m <model>`, `-c model_reasoning_effort="high"`.
 - **omp**: `--auto-approve` means it can touch anything the user can; the
   worktree is discipline, not containment — keep briefs tightly scoped.
   Model is fuzzy-matched (`--model gemini-3.5-flash`, `--model flash`);
@@ -163,6 +168,7 @@ codex:
 cd <abs worktree path> && codex exec \
   --sandbox workspace-write \
   -c 'sandbox_workspace_write.network_access=true' \
+  -c 'features.default_mode_request_user_input=false' \
   -o /tmp/<phase>-result.md \
   "$(cat /tmp/<phase>-brief.md)"
 ```
@@ -202,6 +208,7 @@ git branch -D wt-<phase>
 
 | Symptom | Cause | Action |
 |---|---|---|
+| codex "runs" 10+ min with zero output AND zero diff (not an end-of-run wedge) | global config has `default_mode_request_user_input=true`; the headless lane is blocked asking a question no one can answer | launch with `-c 'features.default_mode_request_user_input=false'` (now in the Step-4 recipe); kill and salvage any partial diff |
 | codex: "Daemon failed to start within 5 seconds" | daemon not pre-warmed, or `network_access` not set | warm daemon from orchestrator; relaunch with the `-c` flag |
 | codex stuck retrying browser fallbacks (node_repl, NODE_PATH, --connect) | same as above | same; salvage any completed diff first |
 | omp: "Use /login, set an API key environment variable..." | no stored credentials and no provider key in env | one-time `omp` + `/login`, or export the provider key; then relaunch |
