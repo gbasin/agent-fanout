@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+LAUNCHER=$ROOT/scripts/launch-codex-lane
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/agent-fanout-launch-test.XXXXXX")
+
+cleanup() {
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+make_repo() {
+  local repo=$1
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email test@example.invalid
+  git -C "$repo" config user.name "Agent Fanout Test"
+  printf 'base\n' > "$repo/file.txt"
+  git -C "$repo" add file.txt
+  git -C "$repo" commit -q -m init
+}
+
+make_fake_codex() {
+  local fake=$1
+  cat > "$fake" <<'FAKE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+mode=${FAKE_CODEX_MODE:?FAKE_CODEX_MODE is required}
+sessions=${CODEX_HOME:?CODEX_HOME is required}/sessions/2026/06/23
+mkdir -p "$sessions"
+rollout=$sessions/rollout-fake-${mode}.jsonl
+cwd=$(pwd)
+if [[ -n "${FAKE_CODEX_PID_FILE:-}" ]]; then
+  printf '%s\n' "$$" > "$FAKE_CODEX_PID_FILE"
+fi
+
+write_started() {
+  printf '{"timestamp":"2026-06-23T00:00:00.000Z","type":"session_meta","payload":{"cwd":"%s"}}\n' "$cwd" > "$rollout"
+  printf '{"timestamp":"2026-06-23T00:00:01.000Z","type":"event_msg","payload":{"type":"task_started"}}\n' >> "$rollout"
+}
+
+case "$mode" in
+  dead-start)
+    write_started
+    while :; do sleep 10; done
+    ;;
+  rollout-start)
+    write_started
+    printf '{"timestamp":"2026-06-23T00:00:02.000Z","type":"response_item","payload":{"type":"message"}}\n' >> "$rollout"
+    ;;
+  diff-start)
+    write_started
+    printf 'changed\n' >> file.txt
+    ;;
+  early-exit)
+    exit 0
+    ;;
+  *)
+    echo "unknown FAKE_CODEX_MODE: $mode" >&2
+    exit 64
+    ;;
+esac
+FAKE
+  chmod +x "$fake"
+}
+
+assert_contains() {
+  local file=$1 text=$2
+  if ! grep -Fq "$text" "$file"; then
+    echo "expected $file to contain: $text" >&2
+    exit 1
+  fi
+}
+
+run_case() {
+  local name=$1 mode=$2 expected=$3 expected_result_text=${4:-}
+  local case_dir=$TMP/$name repo=$TMP/$name/repo fake=$TMP/$name/fake-codex
+  local result=$TMP/$name/result.md run_log=$TMP/$name/run.log brief=$TMP/$name/brief.md
+  local pid_file=$TMP/$name/fake.pid
+  mkdir -p "$case_dir"
+  make_repo "$repo"
+  make_fake_codex "$fake"
+  printf 'test brief for %s\n' "$name" > "$brief"
+
+  set +e
+  CODEX_HOME="$TMP/$name/codex-home" FAKE_CODEX_MODE="$mode" FAKE_CODEX_PID_FILE="$pid_file" \
+    "$LAUNCHER" \
+      --worktree "$repo" \
+      --brief "$brief" \
+      --result "$result" \
+      --run-log "$run_log" \
+      --codex-bin "$fake" \
+      --startup-timeout 2 \
+      --poll-interval 1 \
+      > "$TMP/$name/wrapper.out" 2> "$TMP/$name/wrapper.err"
+  local status=$?
+  set -e
+
+  if [[ "$status" -ne "$expected" ]]; then
+    echo "case $name: expected exit $expected, got $status" >&2
+    echo "--- stdout ---" >&2
+    cat "$TMP/$name/wrapper.out" >&2
+    echo "--- stderr ---" >&2
+    cat "$TMP/$name/wrapper.err" >&2
+    echo "--- result ---" >&2
+    [[ -f "$result" ]] && cat "$result" >&2
+    exit 1
+  fi
+
+  if [[ -n "$expected_result_text" ]]; then
+    assert_contains "$result" "$expected_result_text"
+  fi
+
+  if [[ "$mode" == "dead-start" && -f "$pid_file" ]]; then
+    local fake_pid
+    fake_pid=$(<"$pid_file")
+    if kill -0 "$fake_pid" 2>/dev/null; then
+      echo "case $name: fake codex process still alive after watchdog exit: $fake_pid" >&2
+      exit 1
+    fi
+  fi
+
+  printf 'ok %-18s exit=%s\n' "$name" "$status"
+}
+
+bash -n "$LAUNCHER"
+
+run_case dead-start dead-start 124 "no rollout activity after task_started"
+run_case rollout-start rollout-start 0
+run_case diff-start diff-start 0
+run_case early-exit early-exit 1 "codex exited before any startup signal"
+
+echo "all launch-codex-lane tests passed"

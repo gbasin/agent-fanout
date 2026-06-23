@@ -23,14 +23,14 @@ are fine.
 | **omp** (oh-my-pi) | `omp -p --no-session --auto-approve --model gemini-3.5-flash ...` | mechanical/template phases, high-volume cheap work | **none** — full user permissions |
 
 Runner notes:
-- **codex**: ALWAYS pass `--sandbox workspace-write` explicitly — the global
-  `~/.codex/config.toml` may set `danger-full-access`, and a bare `codex exec`
-  would run unsandboxed. ALSO ALWAYS pass
-  `-c 'features.default_mode_request_user_input=false'` — if the global config
-  enables that under-dev feature, a headless lane that decides to ask a
-  clarifying question blocks forever on stdin (no one answers), showing up as a
-  task that "runs" for many minutes with zero output and zero diff. Knobs:
-  `-m <model>`, `-c model_reasoning_effort="high"`.
+- **codex**: launch through the bundled
+  `scripts/launch-codex-lane` wrapper (Step 4), not raw `codex exec`. The
+  wrapper always passes `--sandbox workspace-write` so global
+  `~/.codex/config.toml` cannot accidentally run lanes unsandboxed, always
+  passes `-c 'features.default_mode_request_user_input=false'` so headless
+  clarification prompts do not block forever, and fails fast if Codex gets
+  stuck after `task_started` but before its first real agent event. Knobs:
+  `--model <model>`, `--reasoning-effort high`.
 - **omp**: `--auto-approve` means it can touch anything the user can; the
   worktree is discipline, not containment — keep briefs tightly scoped.
   Model is fuzzy-matched (`--model gemini-3.5-flash`, `--model flash`);
@@ -218,15 +218,26 @@ known gaps.
 ```
 
 ### 4. Launch (one backgrounded Bash call per phase)
-Each launch is its own Bash call, so start with the preamble. codex:
+Each launch is its own Bash call, so start with the preamble. Use the bundled
+Codex launch wrapper from this skill directory; set `SKILL_DIR` to the base
+directory printed when this skill is loaded. The wrapper supervises the child
+`codex exec`: it waits for the first real startup signal (Codex rollout
+JSONL activity after `task_started`, a result file, or a worktree diff), then
+keeps waiting on the child and returns its final exit code. If no startup signal
+appears within `--startup-timeout`, it kills the process group, writes a
+diagnostic result file, and exits `124`.
+
+codex:
 ```bash
 # <preamble: SID/MAIN/INT>
-cd "$INT/.claude/worktrees/$SID-<phase>" && codex exec \
-  --sandbox workspace-write \
-  -c 'sandbox_workspace_write.network_access=true' \
-  -c 'features.default_mode_request_user_input=false' \
-  -o /tmp/$SID-<phase>-result.md \
-  "$(cat /tmp/$SID-<phase>-brief.md)"
+SKILL_DIR=/path/to/agent-fanout   # use the base directory printed when the skill loaded
+WT=$INT/.claude/worktrees/$SID-<phase>
+"$SKILL_DIR/scripts/launch-codex-lane" \
+  --worktree "$WT" \
+  --brief /tmp/$SID-<phase>-brief.md \
+  --result /tmp/$SID-<phase>-result.md \
+  --run-log /tmp/$SID-<phase>-run.log \
+  --startup-timeout 600
 ```
 omp (e.g. Gemini Flash):
 ```bash
@@ -236,13 +247,18 @@ cd "$INT/.claude/worktrees/$SID-<phase>" && omp -p --no-session --auto-approve \
   @/tmp/$SID-<phase>-brief.md > /tmp/$SID-<phase>-result.md
 ```
 Run with `run_in_background: true`. The completion notification fires when the
-process exits — do not write watcher loops.
+wrapper exits. Do not write watcher loops.
 
 ### 5. Monitor (only when prompted or suspicious)
-Tail the Bash output file. If no new output for ~10 minutes, check
-`git -C <worktree> diff --stat` — runners sometimes wedge AFTER the work is
-done. If the diff looks complete, kill the process and salvage the tree; the
-work is rarely lost.
+Tail the Bash output file and `/tmp/$SID-<phase>-run.log`. The Codex wrapper
+catches dead-start wedges automatically: exit `124` means Codex was alive but
+never produced a first startup signal before the timeout. Read the diagnostic
+result file and either relaunch once or take the lane back manually.
+
+If a runner has already produced startup activity but no new output for ~10
+minutes, check `git -C <worktree> diff --stat` — runners sometimes wedge AFTER
+the work is done. If the diff looks complete, kill the process and salvage the
+tree; the work is rarely lost.
 
 ### 6. Review and merge (orchestrator, into `$INT` — never the primary checkout)
 ```bash
@@ -304,7 +320,8 @@ local landings serialize on its `index.lock` and a loser must rebase and retry.
 
 | Symptom | Cause | Action |
 |---|---|---|
-| codex "runs" 10+ min with zero output AND zero diff (not an end-of-run wedge) | global config has `default_mode_request_user_input=true`; the headless lane is blocked asking a question no one can answer | launch with `-c 'features.default_mode_request_user_input=false'` (now in the Step-4 recipe); kill and salvage any partial diff |
+| codex wrapper exits `124` | Codex launched and stayed alive, but produced no first startup signal before the timeout: no rollout activity after `task_started`, no result file, no worktree diff | read `/tmp/$SID-<phase>-result.md` and `/tmp/$SID-<phase>-run.log`; relaunch once or take the lane back manually |
+| raw codex "runs" 10+ min with zero output AND zero diff (not an end-of-run wedge) | launched without the Step-4 wrapper, or Codex blocked before first agent activity | kill it; relaunch through `scripts/launch-codex-lane` |
 | codex: "Daemon failed to start within 5 seconds" | daemon not pre-warmed, or `network_access` not set | warm daemon from orchestrator; relaunch with the `-c` flag |
 | codex stuck retrying browser fallbacks (node_repl, NODE_PATH, --connect) | same as above | same; salvage any completed diff first |
 | omp: "Use /login, set an API key environment variable..." | no stored credentials and no provider key in env | one-time `omp` + `/login`, or export the provider key; then relaunch |
