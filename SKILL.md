@@ -1,13 +1,13 @@
 ---
 name: agent-fanout
-description: Delegate implementation work to parallel headless agent-CLI subagents (codex by default; omp with a cheap model like Gemini Flash as an alternative) in persistent git worktrees, with Claude as orchestrator (plan, review, merge, final QA). Use when the user asks to delegate to codex or omp, fan out work to subagents, or parallelize implementation across cheaper agents. Includes the recipe for subagents doing their own visual QA via dev-browser.
+description: Delegate implementation work to parallel headless agent-CLI subagents (codex by default; omp with a cheap model like Gemini Flash as an alternative) in persistent git worktrees, with the current agent as orchestrator (plan, review, merge, final QA). Use when the user asks to delegate to codex or omp, fan out work to subagents, or parallelize implementation across cheaper agents. Includes the recipe for subagents doing their own visual QA via dev-browser.
 ---
 
 # Agent fan-out delegation
 
-Claude is the orchestrator: decompose, write precise briefs, review every diff,
-merge, and own final verification. Headless agent CLIs implement. They are
-cheaper and faster, not smarter — never merge their work unreviewed.
+The current agent is the orchestrator: decompose, write precise briefs, review
+every diff, merge, and own final verification. Headless agent CLIs implement.
+They are cheaper and faster, not smarter — never merge their work unreviewed.
 
 ## Runners
 
@@ -45,7 +45,7 @@ Runner notes:
    primary checkout.** Multiple orchestrators may run on one machine/repo at
    once; the main checkout is a shared resource (merge target, test runner)
    and global branch/worktree names collide. Each run picks one short unique
-   `<sid>`, creates `.claude/worktrees/_int-<sid>` on branch `int-<sid>`, and
+   `<sid>`, creates `.worktrees/_int-<sid>` on branch `int-<sid>`, and
    does ALL "main repo" work there. Runner worktrees branch off `int-<sid>`;
    main is touched only by the final atomic merge/PR (Step 7). Every branch,
    worktree path, and `/tmp` artifact is `<sid>`-namespaced so concurrent runs
@@ -87,7 +87,7 @@ preamble (works from the primary checkout or any worktree):
 ```bash
 SID=<sid>                                                       # the token chosen in Step 1
 MAIN=$(git worktree list --porcelain | awk 'NR==1{sub(/^worktree /,"");print}')
-INT=$MAIN/.claude/worktrees/_int-$SID
+INT=$MAIN/.worktrees/_int-$SID
 ```
 
 ### 0. Plan phases
@@ -107,13 +107,13 @@ SID=<short-unique-token>          # pick ONCE (e.g. 2026-06-21-a3f); reuse liter
 
 # avoid the gitlink trap: embedded worktrees must never reach `git add -A`
 # (.git/info/exclude lives in the shared common dir — once covers all worktrees)
-grep -qx '.claude/worktrees/' .git/info/exclude 2>/dev/null \
-  || echo '.claude/worktrees/' >> .git/info/exclude
+grep -qx '.worktrees/' .git/info/exclude 2>/dev/null \
+  || echo '.worktrees/' >> .git/info/exclude
 
 # the orchestrator's OWN isolated checkout; the primary checkout is never mutated
 # until Step 7. Other orchestrators get their own _int-<their-sid> — no contention.
-git worktree add .claude/worktrees/_int-$SID -b int-$SID
-INT=$MAIN/.claude/worktrees/_int-$SID
+git worktree add .worktrees/_int-$SID -b int-$SID
+INT=$MAIN/.worktrees/_int-$SID
 
 # warm the integration tree with gitignored inputs (deps/env) so it can build,
 # test, and run the foundation phase. Same warm() used in Step 2; define it here too
@@ -141,10 +141,10 @@ onto `int-$SID` here, before fan-out; runner diffs are reviewed against its HEAD
 ### 2. Persistent worktrees (one per parallel phase)
 ```bash
 # <preamble: SID/MAIN/INT — see Shell-state caveat>
-git worktree add "$INT/.claude/worktrees/$SID-<phase>" -b wt-$SID-<phase> int-$SID
+git worktree add "$INT/.worktrees/$SID-<phase>" -b wt-$SID-<phase> int-$SID
 ```
 Each runner branches off `int-$SID`, inheriting any committed foundation phase.
-The runner worktrees live *inside* `$INT` — harmless, because `.claude/worktrees/`
+The runner worktrees live *inside* `$INT` — harmless, because `.worktrees/`
 is excluded (Step 1), so `$INT`'s `git add -A` never swallows them as gitlinks.
 
 **Warm the worktree with gitignored inputs.** A fresh worktree contains zero
@@ -163,7 +163,7 @@ git ls-files -o -i --exclude-standard --directory   # gitignored & present
   build needs (codegen output, `expo-env.d.ts`, generated native projects).
 - **Skip the OUTPUTS/ephemera**: `dist/`, `.next/`, build caches,
   `__pycache__`, logs, test artifacts, `.DS_Store` — and NEVER
-  `.claude/worktrees/` (cloning it into a worktree recurses).
+  `.worktrees/` (cloning it into a worktree recurses).
 
 Clone copy-on-write so each worktree gets its own *writable* deps (the runner
 can install a missing one without corrupting the source or sibling worktrees)
@@ -171,14 +171,15 @@ at near-zero disk on APFS/btrfs:
 ```bash
 # <preamble: SID/MAIN/INT>. Source from $INT (the orchestrator's already-warmed tree,
 # which carries any foundation-phase dep changes).
-WT=$INT/.claude/worktrees/$SID-<phase>
+WT=$INT/.worktrees/$SID-<phase>
 warm() {  # warm <src-root> <relpath>
   local src=$1/$2 dst=$WT/$2
   [ -e "$src" ] || return 0
   mkdir -p "$(dirname "$dst")"
-  cp -cR "$src" "$dst" 2>/dev/null \                   # macOS APFS clonefile (CoW)
-    || cp -a --reflink=auto "$src" "$dst" 2>/dev/null \ # Linux btrfs/xfs reflink
-    || ln -s "$src" "$dst"                             # last resort: shared read-only symlink
+  # Try APFS clonefile, then Linux reflink, then a shared symlink fallback.
+  cp -cR "$src" "$dst" 2>/dev/null \
+    || cp -a --reflink=auto "$src" "$dst" 2>/dev/null \
+    || ln -s "$src" "$dst"
 }
 warm "$INT" node_modules; warm "$INT" surface/web/node_modules; warm "$INT" .env
 ```
@@ -239,7 +240,7 @@ codex:
 ```bash
 # <preamble: SID/MAIN/INT>
 SKILL_DIR=/path/to/agent-fanout   # use the base directory printed when the skill loaded
-WT=$INT/.claude/worktrees/$SID-<phase>
+WT=$INT/.worktrees/$SID-<phase>
 "$SKILL_DIR/scripts/launch-codex-lane" \
   --worktree "$WT" \
   --brief /tmp/$SID-<phase>-brief.md \
@@ -250,7 +251,7 @@ WT=$INT/.claude/worktrees/$SID-<phase>
 omp (e.g. Gemini Flash):
 ```bash
 # <preamble: SID/MAIN/INT>
-cd "$INT/.claude/worktrees/$SID-<phase>" && omp -p --no-session --auto-approve \
+cd "$INT/.worktrees/$SID-<phase>" && omp -p --no-session --auto-approve \
   --model gemini-3.5-flash \
   @/tmp/$SID-<phase>-brief.md > /tmp/$SID-<phase>-result.md
 ```
@@ -275,8 +276,8 @@ cd "$INT"
 # stage in the runner tree first, then diff the INDEX — a plain `git diff` shows only
 # tracked changes and would silently drop every NEW file the runner created. `add -A`
 # can't pull in warmed deps (.env/node_modules are gitignored) or the nested worktrees
-# (.claude/worktrees/ is excluded), so it captures exactly the runner's real work.
-RWT=$INT/.claude/worktrees/$SID-<phase>
+# (.worktrees/ is excluded), so it captures exactly the runner's real work.
+RWT=$INT/.worktrees/$SID-<phase>
 git -C "$RWT" add -A
 git -C "$RWT" diff --cached > /tmp/$SID-<phase>.patch
 # READ the patch, check the result file, then apply (—index so new files land staged):
@@ -309,7 +310,7 @@ fi
 # cleanup: runner worktrees/branches first (they live inside $INT), then drop $INT.
 # Use absolute paths — do NOT rely on cwd. Remove the worktree BEFORE its branch.
 for p in <phases>; do
-  git worktree remove "$INT/.claude/worktrees/$SID-$p" --force
+  git worktree remove "$INT/.worktrees/$SID-$p" --force
   git branch -D wt-$SID-$p
 done
 cd "$MAIN"                                  # can't remove a worktree from inside it
@@ -338,7 +339,7 @@ local landings serialize on its `index.lock` and a loser must rebase and retry.
 | worktree vanished mid-task | it was harness-managed (Agent isolation) | kill orphans, recreate persistent worktree, relaunch |
 | companion `status`: "No job found" | per-cwd state; checked from wrong dir | `cd` to the exact launch dir; never treat as completion |
 | task "running" for an hour with frozen progress tail but full diff present | end-of-run wedge | kill, salvage tree, do verification yourself |
-| stray gitlinks in a commit | `.claude/worktrees/` not excluded | pre-flight exclude line; fix commit with `git rm --cached` |
+| stray gitlinks in a commit | `.worktrees/` not excluded | pre-flight exclude line; fix commit with `git rm --cached` |
 | `git worktree add` fails: "branch already exists" / "path already in use" | another orchestrator on the same repo grabbed that name | never use a bare phase name; `<sid>`-namespace every branch and path (Steps 1–2) |
 | `merge --ff-only int-$SID` rejected | a concurrent orchestrator advanced main first | rebase `int-$SID` onto main and retry the merge (don't force) |
 | two runs' screenshots/dev-servers clobber each other | shared daemon singleton + fixed port across orchestrators | `<sid>`-prefix browser names; assign a per-session dev-server port |

@@ -12,7 +12,7 @@ npx skills add gbasin/agent-fanout --all -g
 
 The runners do the volume work — cheaper and faster, reviewed before anything lands. The skill encodes the working recipe for orchestrating them:
 
-1. **The orchestrator runs in its own integration worktree** — never the primary checkout, so several orchestrators can fan out on one machine/repo at once; every branch, path, and `/tmp` artifact is session-namespaced, and main is touched only by the final atomic merge/PR
+1. **The orchestrator runs in its own integration worktree** — never the primary checkout, so several orchestrators can fan out on one machine/repo at once; every branch, `.worktrees/` path, and `/tmp` artifact is session-namespaced, and main is touched only by the final atomic merge/PR
 2. **Foundation first** — if the work needs shared conventions, run one task, review, commit, then fan out
 3. **Disjoint ownership** — each parallel phase owns specific files or functions; shared-file additions go in marked appendix blocks so merges stay trivial
 4. **Persistent worktrees, launched through a Codex startup watchdog** — completion is still process exit, but a dead-started Codex lane fails fast instead of sitting alive for hours with only `task_started`
@@ -30,7 +30,7 @@ Distilled postmortem — a real orchestration session hit every failure mode at 
 - Job-status watchers parsed "no job found" (per-directory job state, checked from the wrong directory) as "finished"
 - A codex task wedged before its first real event: the process was alive with only `session_meta` + `task_started`, no result file, and no worktree diff
 - A codex task wedged for ~2 hours *after* completing its work, retrying browser fallbacks its sandbox could never satisfy
-- Embedded worktree gitlinks snuck into a commit via `git add -A`
+- Embedded worktree gitlinks snuck into a commit via `git add -A`; the procedure excludes `.worktrees/` before creating nested worktrees
 
 ## The visual QA trick
 
