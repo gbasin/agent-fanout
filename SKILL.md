@@ -58,15 +58,23 @@ Runner notes:
    exit.** No status-polling watcher loops. (History: codex-companion
    background jobs key their state per-cwd, so `status` from any other
    directory says "No job found" — which grep watchers misread as "finished".)
-4. **Visual QA from inside a runner works, with preconditions.** Pre-start the
-   dev-browser daemon from the orchestrator before launching (avoids
-   concurrent auto-start races; and under codex's seatbelt, daemon auto-start
-   is impossible — Chrome dies at Mach-port registration, and the task may
-   wedge for hours retrying fallbacks). codex additionally needs
-   `-c 'sandbox_workspace_write.network_access=true'` or the connect to
-   `~/.dev-browser/daemon.sock` is blocked ("Daemon failed to start within 5
-   seconds"). Screenshot writes happen daemon-side into `~/.dev-browser/tmp/`,
-   readable by all runners — they can view the PNGs and check their own work.
+4. **Visual QA from inside a runner is the default — let runners self-QA;
+   don't pull it back to the orchestrator to "avoid the sandbox wedge."** The
+   wedge is fully prevented by ONE action you already do: pre-warm the
+   dev-browser daemon from the orchestrator before launching (the Step-1
+   `dev-browser <<< 'daemon warm'` line). The network half is automatic —
+   `launch-codex-lane` passes `-c sandbox_workspace_write.network_access=true`
+   by default (only `--no-network` disables it), so there is no extra flag to
+   set by hand. With the daemon already up, codex lanes connect to
+   `~/.dev-browser/daemon.sock` and screenshot normally; writes land in
+   `~/.dev-browser/tmp/`, readable by all runners, so they can view their own
+   PNGs and check their work.
+   The wedge only happens if you SKIP the pre-warm: under codex's seatbelt the
+   daemon cannot auto-start (Chrome dies at Mach-port registration) and the
+   task may retry fallbacks for hours ("Daemon failed to start within 5
+   seconds"). So the fix is to pre-warm, not to strip runner-side QA — that
+   just discards a free first-line filter (the orchestrator still owns final
+   QA in Step 7 regardless).
 
 ## Procedure
 
@@ -322,7 +330,7 @@ local landings serialize on its `index.lock` and a loser must rebase and retry.
 |---|---|---|
 | codex wrapper exits `124` | Codex launched and stayed alive, but produced no first startup signal before the timeout: no rollout activity after `task_started`, no result file, no worktree diff | read `/tmp/$SID-<phase>-result.md` and `/tmp/$SID-<phase>-run.log`; relaunch once or take the lane back manually |
 | raw codex "runs" 10+ min with zero output AND zero diff (not an end-of-run wedge) | launched without the Step-4 wrapper, or Codex blocked before first agent activity | kill it; relaunch through `scripts/launch-codex-lane` |
-| codex: "Daemon failed to start within 5 seconds" | daemon not pre-warmed, or `network_access` not set | warm daemon from orchestrator; relaunch with the `-c` flag |
+| codex: "Daemon failed to start within 5 seconds" | daemon not pre-warmed before launch (network is on by default via the wrapper, so it's almost always the missing pre-warm — unless you passed `--no-network`) | pre-warm the daemon from the orchestrator (Step 1), then relaunch; don't strip runner-side QA to dodge it |
 | codex stuck retrying browser fallbacks (node_repl, NODE_PATH, --connect) | same as above | same; salvage any completed diff first |
 | omp: "Use /login, set an API key environment variable..." | no stored credentials and no provider key in env | one-time `omp` + `/login`, or export the provider key; then relaunch |
 | omp touched files outside its scope | no sandbox + loose brief | tighten SCOPE wording; review patch hunks before apply (you do this anyway) |
