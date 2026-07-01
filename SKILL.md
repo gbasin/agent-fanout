@@ -287,18 +287,37 @@ Re-run build/tests in `$INT` after each apply. Overlapping hunks across phases
 mean the ownership split failed — resolve manually, don't re-delegate.
 
 ### 7. Final QA + integrate — yours, not the runners'
-Runner screenshots are a first-line filter. From inside `$INT`, re-verify the
-key surfaces yourself (desktop + mobile widths at minimum), then commit onto
-`int-$SID` and land it — **PR if the repo has a remote, else local merge**:
+Runner screenshots are a first-line filter. From inside `$INT`, run the
+orchestrator's own gate BEFORE landing — it's yours because it crosses the
+phase boundaries no single runner owns:
+- Re-verify the key surfaces yourself (desktop + mobile widths at minimum).
+- Drive the suite to green: build, unit/integration, **and the repo's e2e
+  suite** (Playwright/Cypress/etc.). Locate it before assuming it's absent —
+  grep `package.json` scripts (`test:e2e`, `e2e`, `playwright`, `cypress`) or
+  the CI workflow; if there genuinely is none, say so and fall back to
+  build/tests + visual. On the **local-merge path there is no CI**, so this
+  local run is the ONLY gate and it MUST include e2e. A red suite blocks the
+  land: fix it or drop the offending phase — never merge around it.
+
+Then commit onto `int-$SID` and land it — **PR (land on green CI) if the repo
+has a remote, else local merge**:
 ```bash
 # <preamble: SID/MAIN/INT>
 cd "$INT"
 git add -A && git commit -m "<summary>"
 
-if git remote get-url origin >/dev/null 2>&1; then          # remote → PR (fully isolated)
+if git remote get-url origin >/dev/null 2>&1; then          # remote → PR, land on GREEN CI
   git push -u origin int-$SID
   gh pr create --fill --head int-$SID
-else                                                         # no remote → local merge
+  # land green: block on required checks, THEN merge. Never merge a red/pending PR.
+  # --watch polls the checks to completion; --fail-fast bails on the first failing one.
+  if gh pr checks int-$SID --watch --fail-fast; then
+    gh pr merge int-$SID --squash --delete-branch          # respects branch protection; drops local+remote int-$SID
+  else
+    echo "CI not green — inspect \`gh pr checks int-$SID\`; leave the PR open, do NOT merge"
+  fi
+  # (repos with auto-merge enabled: \`gh pr merge --squash --auto --delete-branch\` also works)
+else                                                         # no remote → local merge (your local gate above IS the CI)
   # lands on whatever branch $MAIN has checked out: confirm it's the target and clean,
   # else this fails or lands in the wrong place.
   git -C "$MAIN" diff --quiet && git -C "$MAIN" diff --cached --quiet \
@@ -315,15 +334,29 @@ for p in <phases>; do
 done
 cd "$MAIN"                                  # can't remove a worktree from inside it
 git worktree remove "$INT" --force
-# local merge → branch is now contained in main, safe-delete works; PR path → -d fails
-# (not merged locally) and `|| true` keeps the branch alive for the open PR.
+# PR path: --delete-branch already dropped local+remote int-$SID (squash-merged, so a
+# plain `-d` would refuse). local-merge path: branch is contained in main and `-d` works.
 git branch -d int-$SID 2>/dev/null || true
+
+# stale sweep — reclaim leftovers from earlier crashed/aborted runs WITHOUT touching a
+# live concurrent orchestrator. Safe because each command only removes what git proves dead:
+git -C "$MAIN" worktree prune                              # clears admin entries for worktrees whose dir is already gone
+git -C "$MAIN" fetch -p origin 2>/dev/null || true         # marks branches whose remote was deleted as [gone]
+git -C "$MAIN" for-each-ref --format '%(refname:short) %(upstream:track)' refs/heads \
+  | awk '$2=="[gone]"{print $1}' \
+  | xargs -r -n1 git -C "$MAIN" branch -D                  # delete ONLY [gone] branches (merged PRs) — never an in-flight run's
+# Local-only orphans (wt-*/int-* from a run that crashed before pushing) can't be told apart
+# from a live run by name, so they are NOT auto-swept — clear those by hand, or via the
+# dedicated clean_gone skill, once you've confirmed no run still owns them.
 ```
 The **PR path is fully isolated** — each run pushes its own `int-<sid>`; GitHub
-serializes the merges. The **local-merge path is not**: `--ff-only` keeps history
-linear and refuses (rather than tangling) when a concurrent run advanced main
-first, but the landing still writes `$MAIN`'s one working tree, so concurrent
-local landings serialize on its `index.lock` and a loser must rebase and retry.
+serializes the merges, and required-checks CI is the authoritative green gate
+(the local suite above is a pre-filter). The **local-merge path is not** isolated
+and has **no CI** — your local build/tests/e2e is the whole gate: `--ff-only`
+keeps history linear and refuses (rather than tangling) when a concurrent run
+advanced main first, but the landing still writes `$MAIN`'s one working tree, so
+concurrent local landings serialize on its `index.lock` and a loser must rebase
+and retry.
 
 ## Failure-mode quick reference
 
@@ -342,5 +375,8 @@ local landings serialize on its `index.lock` and a loser must rebase and retry.
 | stray gitlinks in a commit | `.worktrees/` not excluded | pre-flight exclude line; fix commit with `git rm --cached` |
 | `git worktree add` fails: "branch already exists" / "path already in use" | another orchestrator on the same repo grabbed that name | never use a bare phase name; `<sid>`-namespace every branch and path (Steps 1–2) |
 | `merge --ff-only int-$SID` rejected | a concurrent orchestrator advanced main first | rebase `int-$SID` onto main and retry the merge (don't force) |
+| `gh pr checks --watch` exits non-zero / PR stuck pending | a required CI check failed or never started | inspect `gh pr checks int-$SID`; fix the failure on `int-$SID` and push, or leave the PR open — never merge past a red gate |
+| e2e "passed" but the suite never actually ran | assumed absent without looking | grep `package.json`/CI for `test:e2e`/`playwright`/`cypress` before landing; only fall back to build+visual if there's genuinely none |
+| stale sweep left a dead `wt-*`/`int-*` behind | local-only orphan from a crashed run — indistinguishable from a live run by name | confirm no run owns it, then remove by hand; `worktree prune` + the `[gone]` delete only touch git-proven-dead refs |
 | two runs' screenshots/dev-servers clobber each other | shared daemon singleton + fixed port across orchestrators | `<sid>`-prefix browser names; assign a per-session dev-server port |
 | one run's brief/patch overwrites another's in `/tmp` | `/tmp` is machine-global | `<sid>`-prefix every `/tmp` artifact (Steps 3–6) |

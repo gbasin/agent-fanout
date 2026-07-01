@@ -18,7 +18,7 @@ The runners do the volume work — cheaper and faster, reviewed before anything 
 4. **Persistent worktrees, launched through a Codex startup watchdog** — completion is still process exit, but a dead-started Codex lane fails fast instead of sitting alive for hours with only `task_started`
 5. **No status-polling watcher loops** — the launch wrapper supervises startup liveness; the background-task notification remains the "done/failed" signal
 6. **Patch-based review and merge** — read every diff, `git apply --3way`, re-test after each apply
-7. **Final QA belongs to the orchestrator** — runner screenshots are a first-line filter, not a sign-off; then land the integration branch (PR if the repo has a remote, else local merge)
+7. **Final QA + land-green belongs to the orchestrator** — runner screenshots are a first-line filter, not a sign-off; the orchestrator drives the full suite (build, unit, **e2e**) to green, then lands the integration branch on green CI (PR + wait-for-checks if the repo has a remote, else a local merge gated by that local suite), and sweeps its own — plus any git-proven-dead — worktrees and branches
 
 Mixed fleets are fine: codex for phases needing judgment, omp + Gemini Flash for mechanical ones. Any agent CLI that runs headless, exits on completion, and works against the current directory can slot in.
 
