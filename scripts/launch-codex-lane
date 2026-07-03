@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# Re-exec from a private copy: bash reads scripts incrementally, so editing this
+# file while an instance is mid-run tears the running interpreter (observed as a
+# spurious syntax error while the codex child survives as an orphan). The copy
+# is immune to source edits; it removes itself via the existing EXIT trap chain.
+if [ -z "${LAUNCH_CODEX_LANE_SELFCOPY:-}" ]; then
+  _self_copy=$(mktemp "${TMPDIR:-/tmp}/launch-codex-lane.self.XXXXXX")
+  cp "$0" "$_self_copy"
+  chmod +x "$_self_copy"
+  LAUNCH_CODEX_LANE_SELFCOPY="$_self_copy" exec bash "$_self_copy" "$@"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: launch-codex-lane --worktree DIR --brief FILE --result FILE --run-log FILE [options]
@@ -104,6 +115,7 @@ rm -f "$result"
 sentinel=$(mktemp "${TMPDIR:-/tmp}/agent-fanout-codex-start.XXXXXX")
 cleanup_sentinel() {
   rm -f "$sentinel"
+  rm -f "${LAUNCH_CODEX_LANE_SELFCOPY:-}"
 }
 trap cleanup_sentinel EXIT
 touch "$sentinel"

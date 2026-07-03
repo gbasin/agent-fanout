@@ -435,6 +435,7 @@ and retry.
 | omp: "Use /login, set an API key environment variable..." | no stored credentials and no provider key in env | one-time `omp` + `/login`, or export the provider key; then relaunch |
 | omp touched files outside its scope | no sandbox + loose brief | tighten SCOPE wording; review patch hunks before apply (you do this anyway) |
 | runner wedges on `command not found` / missing `node_modules` | fresh worktree has no gitignored deps | warm the worktree (Step 2) before launch; brief skips-not-retries if deps absent |
+| wrapper dies with a bash syntax error mid-run while codex keeps working | the launcher script was EDITED while an instance ran (bash reads incrementally; fixed by the self-copy re-exec — affects only pre-fix instances) | adopt the orphan: `while kill -0 <codex-pid>; do sleep 20; done` then read the `--result` file as usual |
 | worktree vanished mid-task | it was harness-managed (Agent isolation) | kill orphans, recreate persistent worktree, relaunch |
 | companion `status`: "No job found" | per-cwd state; checked from wrong dir | `cd` to the exact launch dir; never treat as completion |
 | task "running" for an hour with frozen progress tail but full diff present | end-of-run wedge | kill, salvage tree, do verification yourself |
