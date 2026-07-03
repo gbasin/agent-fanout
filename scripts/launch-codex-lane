@@ -238,6 +238,8 @@ startup_signal=
 while kill -0 "$child_pid" 2>/dev/null; do
   if startup_signal=$(detect_startup_signal); then
     echo "agent-fanout: startup confirmed: $startup_signal"
+    echo "agent-fanout: keep waiting for process exit; no diff yet is normal during analysis"
+    echo "agent-fanout: interrupt only for user stop, out-of-scope/destructive writes, or a post-start wedge with complete salvageable diff"
     break
   fi
 

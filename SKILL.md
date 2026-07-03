@@ -59,7 +59,18 @@ Runner notes:
    exit.** No status-polling watcher loops. (History: codex-companion
    background jobs key their state per-cwd, so `status` from any other
    directory says "No job found" — which grep watchers misread as "finished".)
-4. **Visual QA from inside a runner is the default — let runners self-QA;
+4. **A live runner is not failed just because it has no diff yet.** Once the
+   Step-4 wrapper confirms startup activity, the runner owns that lane until
+   its process exits. Analysis, dependency inspection, and test discovery often
+   leave the worktree unchanged for several minutes. Do NOT stop a
+   wrapper-confirmed runner for "no edits yet," and do NOT mark the phase
+   completed from an empty diff. Only interrupt a started runner when the user
+   asks you to stop, the runner is making destructive/out-of-scope changes, or
+   Step 5's post-start wedge criteria are met. If you take a lane back with no
+   diff, call it an abandoned lane, not a completed delegated phase, and either
+   relaunch once with a tighter brief or explicitly report that you implemented
+   it manually after abandoning the runner.
+5. **Visual QA from inside a runner is the default — let runners self-QA;
    don't pull it back to the orchestrator to "avoid the sandbox wedge."** The
    wedge is fully prevented by ONE action you already do: pre-warm the
    dev-browser daemon from the orchestrator before launching (the Step-1
@@ -233,6 +244,11 @@ appendix block marked `# === <phase> additions ===`. Touch nothing else.
 
 Do NOT commit. The orchestrator reviews and merges your working-tree diff.
 
+Do not spin indefinitely in analysis. Once you understand the local pattern,
+make the scoped change, run the requested checks, and report. If you are
+blocked or believe no code change is needed, write that conclusion to the
+result and exit instead of continuing to inspect files.
+
 Your deps are a copy-on-write clone of the orchestrator's — installing a
 missing one is fine and affects no one else. But if the toolchain is absent or
 an install fails, do NOT loop on it: skip the test step, say so in your report,
@@ -285,18 +301,29 @@ cd "$INT/.worktrees/$SID-<phase>" && omp -p --no-session --auto-approve \
   @/tmp/$SID-<phase>-brief.md > /tmp/$SID-<phase>-result.md
 ```
 Run with `run_in_background: true`. The completion notification fires when the
-wrapper exits. Do not write watcher loops.
+wrapper exits. Do not write watcher loops, and do not interrupt a
+wrapper-confirmed runner just because repeated diff checks show no edits. Empty
+diff while the process is still running means "not done yet," not "failed."
 
-### 5. Monitor (only when prompted or suspicious)
+### 5. Monitor (only when prompted, or when a real failure signal exists)
 Tail the Bash output file and `/tmp/$SID-<phase>-run.log`. The Codex wrapper
 catches dead-start wedges automatically: exit `124` means Codex was alive but
 never produced a first startup signal before the timeout. Read the diagnostic
 result file and either relaunch once or take the lane back manually.
 
-If a runner has already produced startup activity but no new output for ~10
-minutes, check `git -C <worktree> diff --stat` — runners sometimes wedge AFTER
-the work is done. If the diff looks complete, kill the process and salvage the
-tree; the work is rarely lost.
+After startup is confirmed, use this decision rule:
+- **Process exited:** review its result file and staged patch in Step 6.
+- **Exit `124`:** startup failed; read diagnostics, then relaunch once or take
+  the lane back manually.
+- **Still running with no diff:** keep waiting. This is normal during analysis.
+- **Still running with no new run-log, result-file, rollout, or diff activity
+  for at least 10 minutes:** check the diff. If the diff looks complete, kill
+  the process and salvage the tree; runners sometimes wedge after finishing the
+  work. If there is still no diff, do not call the phase complete. Relaunch once
+  with a tighter brief, ask the user, or take the lane back manually and report
+  that the runner was abandoned.
+- **Out-of-scope or destructive writes:** stop that runner immediately, discard
+  its patch, tighten the brief, and relaunch or implement manually.
 
 ### 6. Review and merge (orchestrator, into `$INT` — never the primary checkout)
 ```bash
@@ -312,8 +339,12 @@ git -C "$RWT" diff --cached > /tmp/$SID-<phase>.patch
 # READ the patch, check the result file, then apply (—index so new files land staged):
 git apply --3way --index /tmp/$SID-<phase>.patch
 ```
-Re-run build/tests in `$INT` after each apply. Overlapping hunks across phases
-mean the ownership split failed — resolve manually, don't re-delegate.
+An empty patch is not automatically success. Treat it as success only if the
+runner's result file explicitly explains why no code change was needed and you
+agree after inspection. Otherwise relaunch once with a tighter brief or take the
+lane back manually, and report that no runner diff was merged. Re-run
+build/tests in `$INT` after each apply. Overlapping hunks across phases mean
+the ownership split failed — resolve manually, don't re-delegate.
 
 ### 7. Final QA + integrate — yours, not the runners'
 Runner screenshots are a first-line filter. From inside `$INT`, run the
@@ -397,6 +428,8 @@ and retry.
 |---|---|---|
 | codex wrapper exits `124` | Codex launched and stayed alive, but produced no first startup signal before the timeout: no rollout activity after `task_started`, no result file, no worktree diff | read `/tmp/$SID-<phase>-result.md` and `/tmp/$SID-<phase>-run.log`; relaunch once or take the lane back manually |
 | raw codex "runs" 10+ min with zero output AND zero diff (not an end-of-run wedge) | launched without the Step-4 wrapper, or Codex blocked before first agent activity | kill it; relaunch through `scripts/launch-codex-lane` |
+| wrapper-confirmed runner is still running with zero diff | normal analysis/setup period, not a failed lane | keep waiting; only interrupt under Step 5's post-start wedge rule, user stop, or out-of-scope/destructive writes |
+| runner was interrupted with zero diff | orchestrator abandoned the lane before it completed | do not mark it delegated/completed; relaunch once with a tighter brief or state that the implementation was manual |
 | codex: "Daemon failed to start within 5 seconds" | daemon not pre-warmed before launch (network is on by default via the wrapper, so it's almost always the missing pre-warm — unless you passed `--no-network`) | pre-warm the daemon from the orchestrator (Step 1), then relaunch; don't strip runner-side QA to dodge it |
 | codex stuck retrying browser fallbacks (node_repl, NODE_PATH, --connect) | same as above | same; salvage any completed diff first |
 | omp: "Use /login, set an API key environment variable..." | no stored credentials and no provider key in env | one-time `omp` + `/login`, or export the provider key; then relaunch |
