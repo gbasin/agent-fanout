@@ -45,11 +45,12 @@ Runner notes:
    primary checkout.** Multiple orchestrators may run on one machine/repo at
    once; the main checkout is a shared resource (merge target, test runner)
    and global branch/worktree names collide. Each run picks one short unique
-   `<sid>`, creates `.worktrees/_int-<sid>` on branch `int-<sid>`, and
-   does ALL "main repo" work there. Runner worktrees branch off `int-<sid>`;
-   main is touched only by the final atomic merge/PR (Step 7). Every branch,
-   worktree path, and `/tmp` artifact is `<sid>`-namespaced so concurrent runs
-   never collide.
+   `<sid>`, creates `.worktrees/_int-<sid>` on branch `int-<sid>` from the
+   freshly fetched remote target branch (`origin/HEAD` by default, or explicit
+   `BASE_REF=origin/<branch>`), and does ALL "main repo" work there. Runner
+   worktrees branch off `int-<sid>`; main is touched only by the final atomic
+   merge/PR (Step 7). Every branch, worktree path, and `/tmp` artifact is
+   `<sid>`-namespaced so concurrent runs never collide.
 2. **Never combine the Agent tool's `isolation: worktree` with an async
    runner.** If the launching subagent exits before the runner finishes, the
    harness reaps the "unchanged" worktree and orphans the still-running task
@@ -104,16 +105,41 @@ INT=$MAIN/.worktrees/_int-$SID
 ```bash
 MAIN=$(git rev-parse --show-toplevel); cd "$MAIN"
 SID=<short-unique-token>          # pick ONCE (e.g. 2026-06-21-a3f); reuse literally everywhere
+BASE_REF=${BASE_REF:-}            # optional override, e.g. BASE_REF=origin/release
 
 # avoid the gitlink trap: embedded worktrees must never reach `git add -A`
 # (.git/info/exclude lives in the shared common dir — once covers all worktrees)
 grep -qx '.worktrees/' .git/info/exclude 2>/dev/null \
   || echo '.worktrees/' >> .git/info/exclude
 
+# choose the remote target, not the possibly stale/dirty local checkout.
+# If this repo has no origin, fall back to local HEAD for offline/local-only work.
+if git remote get-url origin >/dev/null 2>&1; then
+  git fetch --prune origin
+  if [ -z "$BASE_REF" ]; then
+    BASE_REF=$(git ls-remote --symref origin HEAD \
+      | awk '$1 == "ref:" {sub("^refs/heads/","",$2); print "origin/" $2; exit}')
+  fi
+  if [ -z "$BASE_REF" ]; then
+    BASE_REF=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  fi
+  [ -n "$BASE_REF" ] || { echo "No origin default branch; set BASE_REF=origin/<branch>"; exit 1; }
+  case "$BASE_REF" in
+    origin/*) git fetch origin "${BASE_REF#origin/}:refs/remotes/$BASE_REF" ;;
+  esac
+else
+  test -z "$(git status --porcelain --untracked-files=normal)" \
+    || { echo "Primary checkout dirty and no origin exists; commit/stash first"; exit 1; }
+  BASE_REF=HEAD
+fi
+git rev-parse --verify "$BASE_REF^{commit}" >/dev/null \
+  || { echo "Base ref not found: $BASE_REF"; exit 1; }
+
 # the orchestrator's OWN isolated checkout; the primary checkout is never mutated
 # until Step 7. Other orchestrators get their own _int-<their-sid> — no contention.
-git worktree add .worktrees/_int-$SID -b int-$SID
+git worktree add .worktrees/_int-$SID -b int-$SID "$BASE_REF"
 INT=$MAIN/.worktrees/_int-$SID
+git -C "$INT" config "branch.int-$SID.agentFanoutBase" "$BASE_REF"
 
 # warm the integration tree with gitignored inputs (deps/env) so it can build,
 # test, and run the foundation phase. Same warm() used in Step 2; define it here too
@@ -135,8 +161,11 @@ dev-browser <<< 'console.log("daemon warm")'
 
 cd "$INT"     # every later "main repo" step happens in the integration worktree
 ```
-Start from a clean, committed state. Any foundation phase (Step 0) is committed
-onto `int-$SID` here, before fan-out; runner diffs are reviewed against its HEAD.
+Start from a clean, committed remote target. With `origin`, the integration
+branch deliberately starts from `origin/HEAD` (or your explicit
+`BASE_REF=origin/<branch>`), not from the local checkout's current `HEAD`. Any
+foundation phase (Step 0) is committed onto `int-$SID` here, before fan-out;
+runner diffs are reviewed against its HEAD.
 
 ### 2. Persistent worktrees (one per parallel phase)
 ```bash
@@ -307,8 +336,12 @@ cd "$INT"
 git add -A && git commit -m "<summary>"
 
 if git remote get-url origin >/dev/null 2>&1; then          # remote → PR, land on GREEN CI
+  BASE_REF=$(git config --get branch.int-$SID.agentFanoutBase || true)
+  BASE_BRANCH=${BASE_REF#origin/}
+  [ -n "$BASE_REF" ] && [ "$BASE_BRANCH" != "$BASE_REF" ] \
+    || { echo "Missing origin base ref for int-$SID; inspect branch.int-$SID.agentFanoutBase"; exit 1; }
   git push -u origin int-$SID
-  gh pr create --fill --head int-$SID
+  gh pr create --fill --base "$BASE_BRANCH" --head int-$SID
   # land green: block on required checks, THEN merge. Never merge a red/pending PR.
   # --watch polls the checks to completion; --fail-fast bails on the first failing one.
   if gh pr checks int-$SID --watch --fail-fast; then

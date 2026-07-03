@@ -12,7 +12,7 @@ npx skills add gbasin/agent-fanout --all -g
 
 The runners do the volume work — cheaper and faster, reviewed before anything lands. The skill encodes the working recipe for orchestrating them:
 
-1. **The orchestrator runs in its own integration worktree** — never the primary checkout, so several orchestrators can fan out on one machine/repo at once; every branch, `.worktrees/` path, and `/tmp` artifact is session-namespaced, and main is touched only by the final atomic merge/PR
+1. **The orchestrator runs in its own integration worktree** — created from the freshly fetched remote target branch, never the primary checkout, so several orchestrators can fan out on one machine/repo at once; every branch, `.worktrees/` path, and `/tmp` artifact is session-namespaced, and main is touched only by the final atomic merge/PR
 2. **Foundation first** — if the work needs shared conventions, run one task, review, commit, then fan out
 3. **Disjoint ownership** — each parallel phase owns specific files or functions; shared-file additions go in marked appendix blocks so merges stay trivial
 4. **Persistent worktrees, launched through a Codex startup watchdog** — completion is still process exit, but a dead-started Codex lane fails fast instead of sitting alive for hours with only `task_started`
