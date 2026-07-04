@@ -50,6 +50,11 @@ case "$mode" in
     write_started
     printf '{"timestamp":"2026-06-23T00:00:02.000Z","type":"response_item","payload":{"type":"message"}}\n' >> "$rollout"
     ;;
+  confirmed-hang)
+    write_started
+    printf '{"timestamp":"2026-06-23T00:00:02.000Z","type":"response_item","payload":{"type":"message"}}\n' >> "$rollout"
+    while :; do sleep 10; done
+    ;;
   diff-start)
     write_started
     printf 'changed\n' >> file.txt
@@ -125,11 +130,89 @@ run_case() {
   printf 'ok %-18s exit=%s\n' "$name" "$status"
 }
 
+wait_for() {  # wait_for <timeout-sec> <cmd...>
+  local deadline=$((SECONDS + $1)); shift
+  until "$@" 2>/dev/null; do
+    (( SECONDS < deadline )) || return 1
+    sleep 0.2
+  done
+}
+
+# Signal the wrapper mid-run and check the child's fate. Uses SIGTERM because
+# backgrounded jobs enter with SIGINT ignored (the launcher traps INT/TERM/HUP
+# with one handler, so TERM exercises the same path).
+run_signal_case() {
+  local name=$1 mode=$2 wait_for_confirm=$3 child_should_survive=$4
+  local case_dir=$TMP/$name repo=$TMP/$name/repo fake=$TMP/$name/fake-codex
+  local result=$TMP/$name/result.md run_log=$TMP/$name/run.log brief=$TMP/$name/brief.md
+  local pid_file=$TMP/$name/fake.pid out=$TMP/$name/wrapper.out err=$TMP/$name/wrapper.err
+  mkdir -p "$case_dir"
+  make_repo "$repo"
+  make_fake_codex "$fake"
+  printf 'test brief for %s\n' "$name" > "$brief"
+
+  CODEX_HOME="$TMP/$name/codex-home" FAKE_CODEX_MODE="$mode" FAKE_CODEX_PID_FILE="$pid_file" \
+    "$LAUNCHER" \
+      --worktree "$repo" \
+      --brief "$brief" \
+      --result "$result" \
+      --run-log "$run_log" \
+      --codex-bin "$fake" \
+      --startup-timeout 60 \
+      --poll-interval 1 \
+      > "$out" 2> "$err" &
+  local wrapper_pid=$!
+
+  if ! wait_for 20 test -s "$pid_file"; then
+    echo "case $name: fake codex never started" >&2
+    kill -KILL "$wrapper_pid" 2>/dev/null || true
+    exit 1
+  fi
+  if (( wait_for_confirm )) && ! wait_for 20 grep -q "startup confirmed" "$out"; then
+    echo "case $name: wrapper never confirmed startup" >&2
+    kill -KILL "$wrapper_pid" 2>/dev/null || true
+    exit 1
+  fi
+
+  kill -TERM "$wrapper_pid"
+  set +e
+  wait "$wrapper_pid"
+  local status=$?
+  set -e
+  if [[ "$status" -ne 130 ]]; then
+    echo "case $name: expected wrapper exit 130, got $status" >&2
+    cat "$out" "$err" >&2
+    exit 1
+  fi
+
+  local fake_pid
+  fake_pid=$(<"$pid_file")
+  if (( child_should_survive )); then
+    if ! kill -0 "$fake_pid" 2>/dev/null; then
+      echo "case $name: child was killed but should have been detached" >&2
+      cat "$out" "$err" >&2
+      exit 1
+    fi
+    assert_contains "$err" "codex is still running"
+    kill -KILL "-$fake_pid" 2>/dev/null || kill -KILL "$fake_pid" 2>/dev/null || true
+  else
+    if kill -0 "$fake_pid" 2>/dev/null; then
+      echo "case $name: child survived but should have been killed pre-startup" >&2
+      kill -KILL "-$fake_pid" 2>/dev/null || true
+      exit 1
+    fi
+  fi
+
+  printf 'ok %-18s exit=%s\n' "$name" "$status"
+}
+
 bash -n "$LAUNCHER"
 
 run_case dead-start dead-start 124 "no rollout activity after task_started"
 run_case rollout-start rollout-start 0
 run_case diff-start diff-start 0
 run_case early-exit early-exit 1 "codex exited before any startup signal"
+run_signal_case signal-pre-start dead-start 0 0
+run_signal_case signal-post-start confirmed-hang 1 1
 
 echo "all launch-codex-lane tests passed"

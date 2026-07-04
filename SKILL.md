@@ -28,8 +28,10 @@ Runner notes:
   wrapper always passes `--sandbox workspace-write` so global
   `~/.codex/config.toml` cannot accidentally run lanes unsandboxed, always
   passes `-c 'features.default_mode_request_user_input=false'` so headless
-  clarification prompts do not block forever, and fails fast if Codex gets
-  stuck after `task_started` but before its first real agent event. Knobs:
+  clarification prompts do not block forever, fails fast if Codex gets
+  stuck after `task_started` but before its first real agent event, and once
+  startup is confirmed treats wrapper interruption as detach-not-kill, so a
+  live lane survives orchestrator impatience. Knobs:
   `--model <model>`, `--reasoning-effort high`.
 - **omp**: `--auto-approve` means it can touch anything the user can; the
   worktree is discipline, not containment — keep briefs tightly scoped.
@@ -66,10 +68,15 @@ Runner notes:
    wrapper-confirmed runner for "no edits yet," and do NOT mark the phase
    completed from an empty diff. Only interrupt a started runner when the user
    asks you to stop, the runner is making destructive/out-of-scope changes, or
-   Step 5's post-start wedge criteria are met. If you take a lane back with no
-   diff, call it an abandoned lane, not a completed delegated phase, and either
-   relaunch once with a tighter brief or explicitly report that you implemented
-   it manually after abandoning the runner.
+   Step 5's post-start wedge criteria are met. The wrapper enforces this
+   boundary: after `startup confirmed`, interrupting the wrapper (INT/TERM/HUP)
+   detaches the lane — codex keeps running and the wrapper exits `130` printing
+   the child pid. Stopping a confirmed lane is therefore always an explicit
+   kill of that pid, allowed only for the three reasons above; a killed lane
+   with no result file is abandoned, never completed. If you take a lane back
+   with no diff, call it an abandoned lane, not a completed delegated phase,
+   and either relaunch once with a tighter brief or explicitly report that you
+   implemented it manually after abandoning the runner.
 5. **Visual QA from inside a runner is the default — let runners self-QA;
    don't pull it back to the orchestrator to "avoid the sandbox wedge."** The
    wedge is fully prevented by ONE action you already do: pre-warm the
@@ -279,7 +286,10 @@ directory printed when this skill is loaded. The wrapper supervises the child
 JSONL activity after `task_started`, a result file, or a worktree diff), then
 keeps waiting on the child and returns its final exit code. If no startup signal
 appears within `--startup-timeout`, it kills the process group, writes a
-diagnostic result file, and exits `124`.
+diagnostic result file, and exits `124`. Signals flip meaning at startup
+confirmation: before it, interrupting the wrapper kills the child (a dead
+start is not worth preserving); after it, the wrapper detaches instead — it
+prints the child pid and file paths, exits `130`, and codex keeps running.
 
 codex:
 ```bash
@@ -301,7 +311,9 @@ cd "$INT/.worktrees/$SID-<phase>" && omp -p --no-session --auto-approve \
   @/tmp/$SID-<phase>-brief.md > /tmp/$SID-<phase>-result.md
 ```
 Run with `run_in_background: true`. The completion notification fires when the
-wrapper exits. Do not write watcher loops, and do not interrupt a
+wrapper exits — which is NOT always lane completion: exit `130` after
+"startup confirmed" means the wrapper detached and the runner is still working
+(Step 5). Do not write watcher loops, and do not interrupt a
 wrapper-confirmed runner just because repeated diff checks show no edits. Empty
 diff while the process is still running means "not done yet," not "failed."
 
@@ -315,6 +327,11 @@ After startup is confirmed, use this decision rule:
 - **Process exited:** review its result file and staged patch in Step 6.
 - **Exit `124`:** startup failed; read diagnostics, then relaunch once or take
   the lane back manually.
+- **Exit `130` after "startup confirmed":** the wrapper was interrupted and
+  detached; the runner is STILL RUNNING. Adopt it —
+  `while kill -0 <codex-pid> 2>/dev/null; do sleep 20; done` — then read the
+  result file as usual. Do not relaunch, and do not treat this as a failed
+  lane.
 - **Still running with no diff:** keep waiting. This is normal during analysis.
 - **Still running with no new run-log, result-file, rollout, or diff activity
   for at least 10 minutes:** check the diff. If the diff looks complete, kill
@@ -429,6 +446,7 @@ and retry.
 | codex wrapper exits `124` | Codex launched and stayed alive, but produced no first startup signal before the timeout: no rollout activity after `task_started`, no result file, no worktree diff | read `/tmp/$SID-<phase>-result.md` and `/tmp/$SID-<phase>-run.log`; relaunch once or take the lane back manually |
 | raw codex "runs" 10+ min with zero output AND zero diff (not an end-of-run wedge) | launched without the Step-4 wrapper, or Codex blocked before first agent activity | kill it; relaunch through `scripts/launch-codex-lane` |
 | wrapper-confirmed runner is still running with zero diff | normal analysis/setup period, not a failed lane | keep waiting; only interrupt under Step 5's post-start wedge rule, user stop, or out-of-scope/destructive writes |
+| wrapper exited `130` printing "interrupted after startup; codex is still running" | wrapper got INT/TERM/HUP after startup confirmation — it detaches by design instead of killing the lane | adopt the live runner: `while kill -0 <codex-pid>; do sleep 20; done`, then read the `--result` file; kill the pid only for user stop, destructive/out-of-scope writes, or the Step-5 wedge rule |
 | runner was interrupted with zero diff | orchestrator abandoned the lane before it completed | do not mark it delegated/completed; relaunch once with a tighter brief or state that the implementation was manual |
 | codex: "Daemon failed to start within 5 seconds" | daemon not pre-warmed before launch (network is on by default via the wrapper, so it's almost always the missing pre-warm — unless you passed `--no-network`) | pre-warm the daemon from the orchestrator (Step 1), then relaunch; don't strip runner-side QA to dodge it |
 | codex stuck retrying browser fallbacks (node_repl, NODE_PATH, --connect) | same as above | same; salvage any completed diff first |

@@ -38,6 +38,9 @@ Options:
 Exit codes:
   0     codex completed successfully
   124   startup watchdog killed an alive-but-inactive codex process
+  130   wrapper interrupted by a signal. Before startup confirmation the
+        child is killed too; after "startup confirmed" the wrapper DETACHES
+        and codex keeps running — adopt the pid it prints, not a lane failure
   other codex exit code, or 1 if codex exited cleanly without any startup signal
 EOF
 }
@@ -146,6 +149,7 @@ codex_args+=(-o "$result" "$brief_text")
 
 child_pid=
 child_pgid=
+startup_confirmed=0
 
 kill_child_group() {
   if [[ -n "${child_pid:-}" ]] && kill -0 "$child_pid" 2>/dev/null; then
@@ -156,7 +160,20 @@ kill_child_group() {
   fi
 }
 
+# Before startup is confirmed the wrapper owns the child: a signal kills it
+# (a dead-start is not worth preserving). After confirmation the lane owns
+# itself: a signal detaches so orchestrator impatience cannot destroy live work.
 on_signal() {
+  if (( startup_confirmed )); then
+    {
+      echo "agent-fanout: wrapper interrupted after startup; codex is still running"
+      echo "agent-fanout: child pid=$child_pid worktree=$worktree"
+      echo "agent-fanout: result=$result run_log=$run_log"
+      echo "agent-fanout: adopt with: while kill -0 $child_pid 2>/dev/null; do sleep 20; done"
+      echo "agent-fanout: kill the child only for user stop, destructive/out-of-scope writes, or a 10-minute-quiet wedge"
+    } >&2
+    exit 130
+  fi
   kill_child_group
   exit 130
 }
@@ -249,6 +266,7 @@ startup_signal=
 
 while kill -0 "$child_pid" 2>/dev/null; do
   if startup_signal=$(detect_startup_signal); then
+    startup_confirmed=1
     echo "agent-fanout: startup confirmed: $startup_signal"
     echo "agent-fanout: keep waiting for process exit; no diff yet is normal during analysis"
     echo "agent-fanout: interrupt only for user stop, out-of-scope/destructive writes, or a post-start wedge with complete salvageable diff"
