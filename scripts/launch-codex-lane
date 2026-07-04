@@ -17,17 +17,19 @@ usage() {
 Usage: launch-codex-lane --worktree DIR --brief FILE --result FILE --run-log FILE [options]
 
 Launch codex exec for one agent-fanout lane and fail fast if Codex never
-emits first real startup activity.
+emits child-bound progress, or later goes quiet for too long.
 
 Required:
   --worktree DIR          Git worktree to run in
   --brief FILE            Prompt/brief file passed to codex exec
   --result FILE           Codex -o result file path
-  --run-log FILE          Child stdout/stderr log path
+  --run-log FILE          Child stderr log path
 
 Options:
-  --startup-timeout SEC   Seconds to wait for first activity (default: 600)
-  --poll-interval SEC     Poll interval while waiting for startup (default: 5)
+  --startup-timeout SEC   Seconds to wait for first child progress (default: 600)
+  --quiet-timeout SEC     Seconds of no child progress after startup (default: 600)
+  --event-log FILE        Child codex --json stdout log (default: RUN_LOG.events.jsonl)
+  --poll-interval SEC     Poll interval while waiting (default: 5)
   --codex-bin PATH        Codex executable (default: codex)
   --model MODEL           Add -m MODEL to codex exec
   --reasoning-effort E    Add -c model_reasoning_effort="E"
@@ -37,11 +39,11 @@ Options:
 
 Exit codes:
   0     codex completed successfully
-  124   startup watchdog killed an alive-but-inactive codex process
-  130   wrapper interrupted by a signal. Before startup confirmation the
-        child is killed too; after "startup confirmed" the wrapper DETACHES
+  124   progress watchdog killed an alive-but-inactive codex process
+  130   wrapper interrupted by a signal. Before progress confirmation the
+        child is killed too; after "progress confirmed" the wrapper DETACHES
         and codex keeps running — adopt the pid it prints, not a lane failure
-  other codex exit code, or 1 if codex exited cleanly without any startup signal
+  other codex exit code, or 1 if codex exited cleanly without any progress signal
 EOF
 }
 
@@ -49,7 +51,9 @@ worktree=
 brief=
 result=
 run_log=
+event_log=
 startup_timeout=600
+quiet_timeout=600
 poll_interval=5
 codex_bin=codex
 model=
@@ -69,6 +73,10 @@ while (($#)); do
       run_log=${2:-}; shift 2 ;;
     --startup-timeout)
       startup_timeout=${2:-}; shift 2 ;;
+    --quiet-timeout)
+      quiet_timeout=${2:-}; shift 2 ;;
+    --event-log)
+      event_log=${2:-}; shift 2 ;;
     --poll-interval)
       poll_interval=${2:-}; shift 2 ;;
     --codex-bin)
@@ -100,8 +108,10 @@ die() {
 [[ -n "$result" ]] || die "--result is required"
 [[ -n "$run_log" ]] || die "--run-log is required"
 [[ "$startup_timeout" =~ ^[0-9]+$ ]] || die "--startup-timeout must be an integer"
+[[ "$quiet_timeout" =~ ^[0-9]+$ ]] || die "--quiet-timeout must be an integer"
 [[ "$poll_interval" =~ ^[0-9]+$ ]] || die "--poll-interval must be an integer"
 (( startup_timeout > 0 )) || die "--startup-timeout must be positive"
+(( quiet_timeout > 0 )) || die "--quiet-timeout must be positive"
 (( poll_interval > 0 )) || die "--poll-interval must be positive"
 [[ -d "$worktree" ]] || die "worktree does not exist: $worktree"
 worktree=$(cd "$worktree" && pwd -P)
@@ -111,9 +121,14 @@ git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
 command -v "$codex_bin" >/dev/null 2>&1 || die "codex executable not found: $codex_bin"
 command -v perl >/dev/null 2>&1 || die "perl is required to launch codex in its own process group"
 
-mkdir -p "$(dirname "$result")" "$(dirname "$run_log")"
+if [[ -z "$event_log" ]]; then
+  event_log=$run_log.events.jsonl
+fi
+
+mkdir -p "$(dirname "$result")" "$(dirname "$run_log")" "$(dirname "$event_log")"
 rm -f "$result"
 : > "$run_log"
+: > "$event_log"
 
 sentinel=$(mktemp "${TMPDIR:-/tmp}/agent-fanout-codex-start.XXXXXX")
 cleanup_sentinel() {
@@ -130,7 +145,7 @@ perl -e 'utime(time() - 2, time() - 2, @ARGV)' "$sentinel" 2>/dev/null || true
 baseline_status=$(git -C "$worktree" status --porcelain --untracked-files=normal)
 brief_text=$(<"$brief")
 
-codex_args=(exec --sandbox workspace-write)
+codex_args=(exec --json --sandbox workspace-write)
 if (( network_enabled )); then
   codex_args+=(-c sandbox_workspace_write.network_access=true)
 fi
@@ -149,7 +164,7 @@ codex_args+=(-o "$result" "$brief_text")
 
 child_pid=
 child_pgid=
-startup_confirmed=0
+progress_confirmed=0
 
 kill_child_group() {
   if [[ -n "${child_pid:-}" ]] && kill -0 "$child_pid" 2>/dev/null; then
@@ -160,17 +175,17 @@ kill_child_group() {
   fi
 }
 
-# Before startup is confirmed the wrapper owns the child: a signal kills it
+# Before progress is confirmed the wrapper owns the child: a signal kills it
 # (a dead-start is not worth preserving). After confirmation the lane owns
 # itself: a signal detaches so orchestrator impatience cannot destroy live work.
 on_signal() {
-  if (( startup_confirmed )); then
+  if (( progress_confirmed )); then
     {
-      echo "agent-fanout: wrapper interrupted after startup; codex is still running"
+      echo "agent-fanout: wrapper interrupted after progress; codex is still running"
       echo "agent-fanout: child pid=$child_pid worktree=$worktree"
-      echo "agent-fanout: result=$result run_log=$run_log"
+      echo "agent-fanout: result=$result run_log=$run_log event_log=$event_log"
       echo "agent-fanout: adopt with: while kill -0 $child_pid 2>/dev/null; do sleep 20; done"
-      echo "agent-fanout: kill the child only for user stop, destructive/out-of-scope writes, or a 10-minute-quiet wedge"
+      echo "agent-fanout: kill the child only for user stop, destructive/out-of-scope writes, or an adopted-runner quiet wedge"
     } >&2
     exit 130
   fi
@@ -183,25 +198,57 @@ trap on_signal INT TERM HUP
   cd "$worktree"
   exec perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
     "$codex_bin" "${codex_args[@]}"
-) >"$run_log" 2>&1 &
+) >"$event_log" 2>"$run_log" </dev/null &
 child_pid=$!
 child_pgid=$child_pid
 
 echo "agent-fanout: launched codex pid=$child_pid worktree=$worktree"
-echo "agent-fanout: startup timeout=${startup_timeout}s run_log=$run_log result=$result"
+echo "agent-fanout: startup timeout=${startup_timeout}s quiet timeout=${quiet_timeout}s run_log=$run_log event_log=$event_log result=$result"
 
 rollout_files_for_worktree() {
   local sessions_dir=${CODEX_HOME:-$HOME/.codex}/sessions
   [[ -d "$sessions_dir" ]] || return 0
   find "$sessions_dir" -type f -name 'rollout-*.jsonl' -newer "$sentinel" -print 2>/dev/null \
     | while IFS= read -r file; do
-        grep -Fq "$worktree" "$file" 2>/dev/null && printf '%s\n' "$file"
+        if command -v ruby >/dev/null 2>&1; then
+          ruby -rjson -e '
+            target = ARGV.shift
+            file = ARGV.shift
+            meta = File.foreach(file).find { |line| line.include?("\"session_meta\"") }
+            exit 1 unless meta
+            payload = JSON.parse(meta).fetch("payload", {})
+            exit(payload["cwd"] == target && payload["originator"] == "codex_exec" ? 0 : 1)
+          ' "$worktree" "$file" 2>/dev/null && printf '%s\n' "$file"
+        else
+          grep -Fq "\"cwd\":\"$worktree\"" "$file" 2>/dev/null \
+            && grep -Fq '"originator":"codex_exec"' "$file" 2>/dev/null \
+            && printf '%s\n' "$file"
+        fi
       done
 }
 
-detect_startup_signal() {
+event_progress_count() {
+  grep -Ec '"type"[[:space:]]*:[[:space:]]*"(turn\.started|turn\.completed|turn\.failed|error|item\.started|item\.completed)"|"_type"[[:space:]]*:[[:space:]]*"(turn\.started|turn\.completed|turn\.failed|error|item\.started|item\.completed)"' "$event_log" 2>/dev/null || true
+}
+
+file_size() {
+  if [[ -e "$1" ]]; then
+    wc -c < "$1" | tr -d '[:space:]'
+  else
+    printf 0
+  fi
+}
+
+detect_progress_signal() {
   if [[ -s "$result" ]]; then
     printf 'result file created'
+    return 0
+  fi
+
+  local events
+  events=$(event_progress_count)
+  if [[ "$events" =~ ^[0-9]+$ ]] && (( events > 0 )); then
+    printf 'codex json progress (%s events)' "$events"
     return 0
   fi
 
@@ -212,31 +259,25 @@ detect_startup_signal() {
     return 0
   fi
 
-  local file line_count
-  while IFS= read -r file; do
-    line_count=$(wc -l < "$file" | tr -d '[:space:]')
-    if [[ "$line_count" =~ ^[0-9]+$ ]] && (( line_count > 2 )); then
-      printf 'codex rollout activity in %s (%s records)' "$file" "$line_count"
-      return 0
-    fi
-  done < <(rollout_files_for_worktree)
-
   return 1
 }
 
 write_diagnostic_result() {
   local reason=$1
   {
-    echo "Codex lane startup watchdog failed."
+    echo "Codex lane progress watchdog failed."
     echo
     echo "Reason: $reason"
     echo "Worktree: $worktree"
     echo "Brief: $brief"
     echo "Run log: $run_log"
+    echo "Event log: $event_log"
     echo "Startup timeout: ${startup_timeout}s"
+    echo "Quiet timeout: ${quiet_timeout}s"
     echo "Child pid: ${child_pid:-unknown}"
+    echo "Progress confirmed: $progress_confirmed"
     echo
-    echo "Matching Codex rollout files:"
+    echo "Child Codex rollout files:"
     local any=0 file line_count
     while IFS= read -r file; do
       any=1
@@ -246,6 +287,9 @@ write_diagnostic_result() {
     if (( ! any )); then
       echo "- none found after launch"
     fi
+    echo
+    echo "Event log tail:"
+    tail -80 "$event_log" 2>/dev/null || true
     echo
     echo "Git status delta:"
     local current_status
@@ -261,21 +305,58 @@ write_diagnostic_result() {
   } > "$result"
 }
 
-deadline=$((SECONDS + startup_timeout))
-startup_signal=
+startup_deadline=$((SECONDS + startup_timeout))
+last_progress_at=$SECONDS
+last_progress_signal=
+last_event_size=0
+last_result_size=0
+last_run_log_size=0
+last_status=$baseline_status
+
+record_progress() {
+  last_progress_signal=$1
+  last_progress_at=$SECONDS
+  if (( ! progress_confirmed )); then
+    progress_confirmed=1
+    echo "agent-fanout: progress confirmed: $last_progress_signal"
+    echo "agent-fanout: keep waiting for process exit; no diff yet is normal during analysis"
+    echo "agent-fanout: interrupt only for user stop or out-of-scope/destructive writes; quiet wedges are supervised by the wrapper"
+  fi
+}
+
+poll_progress() {
+  local signal current_event_size current_result_size current_run_log_size current_status
+  if signal=$(detect_progress_signal); then
+    current_event_size=$(file_size "$event_log")
+    current_result_size=$(file_size "$result")
+    current_run_log_size=$(file_size "$run_log")
+    current_status=$(git -C "$worktree" status --porcelain --untracked-files=normal)
+    if [[ "$signal" != "$last_progress_signal" || "$current_event_size" != "$last_event_size" || "$current_result_size" != "$last_result_size" || "$current_run_log_size" != "$last_run_log_size" || "$current_status" != "$last_status" ]]; then
+      last_event_size=$current_event_size
+      last_result_size=$current_result_size
+      last_run_log_size=$current_run_log_size
+      last_status=$current_status
+      record_progress "$signal"
+    elif (( ! progress_confirmed )); then
+      record_progress "$signal"
+    fi
+  fi
+}
 
 while kill -0 "$child_pid" 2>/dev/null; do
-  if startup_signal=$(detect_startup_signal); then
-    startup_confirmed=1
-    echo "agent-fanout: startup confirmed: $startup_signal"
-    echo "agent-fanout: keep waiting for process exit; no diff yet is normal during analysis"
-    echo "agent-fanout: interrupt only for user stop, out-of-scope/destructive writes, or a post-start wedge with complete salvageable diff"
-    break
+  poll_progress
+
+  if (( ! progress_confirmed && SECONDS >= startup_deadline )); then
+    echo "agent-fanout: startup progress watchdog timed out; killing codex process group" >&2
+    write_diagnostic_result "no child progress before startup timeout: no codex --json progress event, no result file, and no worktree diff"
+    kill_child_group
+    wait "$child_pid" 2>/dev/null || true
+    exit 124
   fi
 
-  if (( SECONDS >= deadline )); then
-    echo "agent-fanout: startup watchdog timed out; killing codex process group" >&2
-    write_diagnostic_result "no rollout activity after task_started, no result file, and no worktree diff"
+  if (( progress_confirmed && SECONDS - last_progress_at >= quiet_timeout )); then
+    echo "agent-fanout: quiet progress watchdog timed out; killing codex process group" >&2
+    write_diagnostic_result "no child progress for ${quiet_timeout}s after: ${last_progress_signal:-unknown}"
     kill_child_group
     wait "$child_pid" 2>/dev/null || true
     exit 124
@@ -284,24 +365,20 @@ while kill -0 "$child_pid" 2>/dev/null; do
   sleep "$poll_interval"
 done
 
-if [[ -z "$startup_signal" ]]; then
-  set +e
-  wait "$child_pid"
-  child_status=$?
-  set -e
-  if startup_signal=$(detect_startup_signal); then
-    echo "agent-fanout: startup confirmed at process exit: $startup_signal"
-    exit "$child_status"
-  fi
-  write_diagnostic_result "codex exited before any startup signal (exit $child_status)"
-  if (( child_status == 0 )); then
-    exit 1
-  fi
-  exit "$child_status"
-fi
-
 set +e
 wait "$child_pid"
 child_status=$?
 set -e
+
+poll_progress
+if (( ! progress_confirmed )); then
+  if signal=$(detect_progress_signal); then
+    record_progress "$signal at process exit"
+  else
+    write_diagnostic_result "codex exited before any child progress signal (exit $child_status)"
+    if (( child_status == 0 )); then
+      exit 1
+    fi
+  fi
+fi
 exit "$child_status"

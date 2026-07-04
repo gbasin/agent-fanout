@@ -15,8 +15,8 @@ The runners do the volume work — cheaper and faster, reviewed before anything 
 1. **The orchestrator runs in its own integration worktree** — created from the freshly fetched remote target branch, never the primary checkout, so several orchestrators can fan out on one machine/repo at once; every branch, `.worktrees/` path, and `/tmp` artifact is session-namespaced, and main is touched only by the final atomic merge/PR
 2. **Foundation first** — if the work needs shared conventions, run one task, review, commit, then fan out
 3. **Disjoint ownership** — each parallel phase owns specific files or functions; shared-file additions go in marked appendix blocks so merges stay trivial
-4. **Persistent worktrees, launched through a Codex startup watchdog** — completion is still process exit, but a dead-started Codex lane fails fast instead of sitting alive for hours with only `task_started`
-5. **No status-polling watcher loops** — the launch wrapper supervises startup liveness; the background-task notification remains the "done/failed" signal
+4. **Persistent worktrees, launched through a Codex progress watchdog** — completion is still process exit, but dead-started or quiet-wedged Codex lanes fail fast instead of sitting alive for hours with only startup events
+5. **No status-polling watcher loops** — the launch wrapper supervises child-bound progress; the background-task notification remains the "done/failed" signal
 6. **Patch-based review and merge** — read every diff, `git apply --3way`, re-test after each apply
 7. **Final QA + land-green belongs to the orchestrator** — runner screenshots are a first-line filter, not a sign-off; the orchestrator drives the full suite (build, unit, **e2e**) to green, then lands the integration branch on green CI (PR + wait-for-checks if the repo has a remote, else a local merge gated by that local suite), and sweeps its own — plus any git-proven-dead — worktrees and branches
 
@@ -29,6 +29,7 @@ Distilled postmortem — a real orchestration session hit every failure mode at 
 - Harness-managed worktree isolation reaped the worktree out from under a still-running async codex task, orphaning it in a deleted directory
 - Job-status watchers parsed "no job found" (per-directory job state, checked from the wrong directory) as "finished"
 - A codex task wedged before its first real event: the process was alive with only `session_meta` + `task_started`, no result file, and no worktree diff
+- The first startup watchdog falsely accepted the parent/orchestrator transcript because the launch command contained the runner worktree path; liveness now comes from the child `codex exec --json` stream plus result/worktree changes, and rollout files are only diagnostics when their `session_meta.cwd` exactly matches the lane worktree
 - A codex task wedged for ~2 hours *after* completing its work, retrying browser fallbacks its sandbox could never satisfy
 - Embedded worktree gitlinks snuck into a commit via `git add -A`; the procedure excludes `.worktrees/` before creating nested worktrees
 

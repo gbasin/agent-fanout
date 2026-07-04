@@ -37,27 +37,89 @@ if [[ -n "${FAKE_CODEX_PID_FILE:-}" ]]; then
 fi
 
 write_started() {
-  printf '{"timestamp":"2026-06-23T00:00:00.000Z","type":"session_meta","payload":{"cwd":"%s"}}\n' "$cwd" > "$rollout"
+  printf '{"timestamp":"2026-06-23T00:00:00.000Z","type":"session_meta","payload":{"cwd":"%s","originator":"codex_exec"}}\n' "$cwd" > "$rollout"
   printf '{"timestamp":"2026-06-23T00:00:01.000Z","type":"event_msg","payload":{"type":"task_started"}}\n' >> "$rollout"
+}
+
+result=
+json=0
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --json)
+      json=1
+      ;;
+    -o|--output-last-message)
+      i=$((i + 1))
+      result=${args[$i]:-}
+      ;;
+  esac
+done
+
+emit_json() {
+  if (( json )); then
+    printf '%s\n' "$1"
+  else
+    printf '%s\n' "$1" >&2
+  fi
 }
 
 case "$mode" in
   dead-start)
     write_started
+    emit_json '{"type":"thread.started","thread_id":"fake-thread"}'
     while :; do sleep 10; done
     ;;
-  rollout-start)
+  parent-rollout-false-positive)
+    parent=$sessions/rollout-parent-${mode}.jsonl
+    printf '{"timestamp":"2026-06-23T00:00:00.000Z","type":"session_meta","payload":{"cwd":"%s","originator":"codex-tui"}}\n' "$cwd/.." > "$parent"
+    printf '{"timestamp":"2026-06-23T00:00:01.000Z","type":"response_item","payload":{"type":"function_call","arguments":"launch --worktree %s"}}\n' "$cwd" >> "$parent"
     write_started
-    printf '{"timestamp":"2026-06-23T00:00:02.000Z","type":"response_item","payload":{"type":"message"}}\n' >> "$rollout"
+    emit_json '{"type":"thread.started","thread_id":"fake-thread"}'
+    while :; do sleep 10; done
+    ;;
+  json-start)
+    write_started
+    emit_json '{"type":"thread.started","thread_id":"fake-thread"}'
+    emit_json '{"type":"turn.started"}'
+    emit_json '{"type":"item.started","item":{"id":"item_1","type":"command_execution","status":"in_progress"}}'
+    emit_json '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","status":"completed"}}'
     ;;
   confirmed-hang)
     write_started
-    printf '{"timestamp":"2026-06-23T00:00:02.000Z","type":"response_item","payload":{"type":"message"}}\n' >> "$rollout"
+    emit_json '{"type":"thread.started","thread_id":"fake-thread"}'
+    emit_json '{"type":"turn.started"}'
+    emit_json '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"started"}}'
     while :; do sleep 10; done
     ;;
   diff-start)
     write_started
+    emit_json '{"type":"thread.started","thread_id":"fake-thread"}'
     printf 'changed\n' >> file.txt
+    ;;
+  result-start)
+    write_started
+    emit_json '{"type":"thread.started","thread_id":"fake-thread"}'
+    [[ -n "$result" ]] && printf 'done\n' > "$result"
+    ;;
+  result-then-hang)
+    write_started
+    emit_json '{"type":"thread.started","thread_id":"fake-thread"}'
+    emit_json '{"type":"turn.started"}'
+    emit_json '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"done"}}'
+    [[ -n "$result" ]] && printf 'done\n' > "$result"
+    while :; do sleep 10; done
+    ;;
+  stderr-progress)
+    write_started
+    emit_json '{"type":"thread.started","thread_id":"fake-thread"}'
+    emit_json '{"type":"turn.started"}'
+    emit_json '{"type":"item.started","item":{"id":"item_1","type":"command_execution","status":"in_progress"}}'
+    for i in 1 2 3; do
+      printf 'still running %s\n' "$i" >&2
+      sleep 1
+    done
+    emit_json '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","status":"completed"}}'
     ;;
   early-exit)
     exit 0
@@ -98,6 +160,7 @@ run_case() {
       --run-log "$run_log" \
       --codex-bin "$fake" \
       --startup-timeout 2 \
+      --quiet-timeout 2 \
       --poll-interval 1 \
       > "$TMP/$name/wrapper.out" 2> "$TMP/$name/wrapper.err"
   local status=$?
@@ -159,6 +222,7 @@ run_signal_case() {
       --run-log "$run_log" \
       --codex-bin "$fake" \
       --startup-timeout 60 \
+      --quiet-timeout 60 \
       --poll-interval 1 \
       > "$out" 2> "$err" &
   local wrapper_pid=$!
@@ -168,8 +232,8 @@ run_signal_case() {
     kill -KILL "$wrapper_pid" 2>/dev/null || true
     exit 1
   fi
-  if (( wait_for_confirm )) && ! wait_for 20 grep -q "startup confirmed" "$out"; then
-    echo "case $name: wrapper never confirmed startup" >&2
+  if (( wait_for_confirm )) && ! wait_for 20 grep -q "progress confirmed" "$out"; then
+    echo "case $name: wrapper never confirmed progress" >&2
     kill -KILL "$wrapper_pid" 2>/dev/null || true
     exit 1
   fi
@@ -208,10 +272,14 @@ run_signal_case() {
 
 bash -n "$LAUNCHER"
 
-run_case dead-start dead-start 124 "no rollout activity after task_started"
-run_case rollout-start rollout-start 0
+run_case dead-start dead-start 124 "no child progress before startup timeout"
+run_case parent-rollout-false-positive parent-rollout-false-positive 124 "no child progress before startup timeout"
+run_case json-start json-start 0
 run_case diff-start diff-start 0
-run_case early-exit early-exit 1 "codex exited before any startup signal"
+run_case result-start result-start 0
+run_case result-then-hang result-then-hang 124 "no child progress for 2s"
+run_case stderr-progress stderr-progress 0
+run_case early-exit early-exit 1 "codex exited before any child progress signal"
 run_signal_case signal-pre-start dead-start 0 0
 run_signal_case signal-post-start confirmed-hang 1 1
 
