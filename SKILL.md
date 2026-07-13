@@ -175,6 +175,8 @@ warm() {  # warm <src-root> <relpath>
     || ln -s "$src" "$dst"
 }
 warm "$MAIN" node_modules; warm "$MAIN" .env        # the classified inputs
+# and any compiler caches a phase will need — discover them; see Step 2 for why
+# these are worth cloning and how to enumerate them for your toolchain.
 
 # if any phase needs visual QA: warm the daemon OUTSIDE any sandbox. The daemon is a
 # MACHINE singleton (~/.dev-browser/daemon.sock) shared by every orchestrator — don't
@@ -213,9 +215,37 @@ git ls-files -o -i --exclude-standard --directory   # gitignored & present
   `.venv`, `vendor`, `Pods`), env/secret files (`.env*`, token-bearing
   `.npmrc`, service-account JSON), and gitignored-but-generated sources the
   build needs (codegen output, `expo-env.d.ts`, generated native projects).
-- **Skip the OUTPUTS/ephemera**: `dist/`, `.next/`, build caches,
-  `__pycache__`, logs, test artifacts, `.DS_Store` — and NEVER
-  `.worktrees/` (cloning it into a worktree recurses).
+- **Skip the OUTPUTS/ephemera**: `dist/`, `.next/`, `__pycache__`, logs, test
+  artifacts, `.DS_Store` — and NEVER `.worktrees/` (cloning it into a worktree
+  recurses).
+- **But DO clone the expensive COMPILER caches** — cargo's `target/`, and
+  anything like it. This is the one "build cache" you must not skip. A fresh
+  worktree has an empty `target/`, so every Rust lane recompiles the entire
+  dependency graph before it runs a single test, and N parallel lanes do it N
+  times while fighting each other for CPU. It is usually the largest single
+  source of dead wall-clock in a fanout. Measured on a 528-crate workspace:
+
+  | `cargo test --no-run` in a fresh worktree | wall-clock |
+  |---|---|
+  | empty `target/` (what you get if you skip this) | **1:42** |
+  | `target/` cloned from the main checkout (clone itself: 2.3s) | **0:12** |
+
+  Cloning is safe because cargo fingerprints every unit and revalidates on each
+  build — a stale or mismatched artifact gets rebuilt, never silently reused.
+  Copy-on-write makes it near-free: a 3 GB `target/` clones in ~2s and consumes
+  ~0 extra disk until something rewrites a block.
+
+  Generalize by *property, not by name*: clone a cache when it is *expensive to
+  regenerate* AND *self-validating* (the tool checks freshness itself). Cargo
+  `target/`, Gradle's caches, and a built `.venv` qualify. `dist/`, `.next/`,
+  and friends do not — cheap to rebuild, and not revalidated. Keep skipping those.
+
+  **Do not reach for `sccache`/`RUSTC_WRAPPER` to solve this.** Its cache key
+  includes the target-dir path, so worktrees at different absolute paths share
+  *zero* hits (measured: same path wiped = 100% hit; different path = 0%). Worse,
+  setting `RUSTC_WRAPPER` changes every unit's fingerprint, so turning it on
+  *invalidates* a cloned `target/` and forces the full rebuild you were avoiding.
+  Clone the directory; leave the wrapper alone.
 
 Clone copy-on-write so each worktree gets its own *writable* deps (the runner
 can install a missing one without corrupting the source or sibling worktrees)
@@ -234,6 +264,14 @@ warm() {  # warm <src-root> <relpath>
     || ln -s "$src" "$dst"
 }
 warm "$INT" node_modules; warm "$INT" surface/web/node_modules; warm "$INT" .env
+
+# Compiler caches — discover them, don't hardcode. A cache dir is only worth
+# cloning if it already exists in the source tree (i.e. that toolchain has been
+# built at least once). Cargo example; the same shape works for any ecosystem:
+while read -r d; do warm "$MAIN" "$d"; done < <(
+  cd "$MAIN" && git ls-files '*Cargo.toml' | xargs -n1 dirname | sort -u \
+    | while read -r c; do [ -d "$c/target" ] && echo "$c/target"; done
+)
 ```
 `cp -c` / `--reflink=auto` self-fall-back to a *full* copy off-APFS or
 cross-volume; for a huge dep dir on another volume, `ln -s` it instead
