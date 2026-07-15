@@ -29,6 +29,7 @@ Options:
   --startup-timeout SEC   Seconds to wait for first child progress (default: 600)
   --quiet-timeout SEC     Seconds of no child progress after startup (default: 600)
   --event-log FILE        Child codex --json stdout log (default: RUN_LOG.events.jsonl)
+  --state-dir DIR         Persist machine-readable lane lifecycle and PID files
   --poll-interval SEC     Poll interval while waiting (default: 5)
   --codex-bin PATH        Codex executable (default: codex)
   --model MODEL           Add -m MODEL to codex exec
@@ -52,6 +53,7 @@ brief=
 result=
 run_log=
 event_log=
+state_dir=
 startup_timeout=600
 quiet_timeout=600
 poll_interval=5
@@ -77,6 +79,8 @@ while (($#)); do
       quiet_timeout=${2:-}; shift 2 ;;
     --event-log)
       event_log=${2:-}; shift 2 ;;
+    --state-dir)
+      state_dir=${2:-}; shift 2 ;;
     --poll-interval)
       poll_interval=${2:-}; shift 2 ;;
     --codex-bin)
@@ -130,12 +134,55 @@ rm -f "$result"
 : > "$run_log"
 : > "$event_log"
 
+atomic_write() {
+  local file=$1 value=$2 tmp
+  tmp=$file.tmp.$$
+  printf '%s\n' "$value" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+set_lane_status() {
+  [[ -n "$state_dir" ]] || return 0
+  atomic_write "$state_dir/status" "$1"
+}
+
+final_state_override=
+if [[ -n "$state_dir" ]]; then
+  mkdir -p "$state_dir"
+  atomic_write "$state_dir/wrapper.pid" "$$"
+  atomic_write "$state_dir/wrapper.start" "$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')"
+  atomic_write "$state_dir/worktree" "$worktree"
+  atomic_write "$state_dir/result" "$result"
+  atomic_write "$state_dir/run-log" "$run_log"
+  atomic_write "$state_dir/event-log" "$event_log"
+  set_lane_status dispatching
+fi
+
 sentinel=$(mktemp "${TMPDIR:-/tmp}/agent-fanout-codex-start.XXXXXX")
 cleanup_sentinel() {
   rm -f "$sentinel"
   rm -f "${LAUNCH_CODEX_LANE_SELFCOPY:-}"
 }
-trap cleanup_sentinel EXIT
+on_exit() {
+  local code=$?
+  cleanup_sentinel
+  if [[ -n "$state_dir" ]]; then
+    atomic_write "$state_dir/exit-code" "$code"
+    case "$final_state_override" in
+      cancelled|interrupted|failed)
+        set_lane_status "$final_state_override"
+        ;;
+      *)
+        if (( code == 0 )); then
+          set_lane_status succeeded
+        else
+          set_lane_status failed
+        fi
+        ;;
+    esac
+  fi
+}
+trap on_exit EXIT
 touch "$sentinel"
 # BSD find's -newer can effectively compare at coarse timestamp resolution in
 # fast tests and launches. Backdate the sentinel slightly so a rollout created
@@ -179,6 +226,12 @@ kill_child_group() {
 # (a dead-start is not worth preserving). After confirmation the lane owns
 # itself: a signal detaches so orchestrator impatience cannot destroy live work.
 on_signal() {
+  if [[ -n "$state_dir" ]]; then
+    final_state_override=interrupted
+    set_lane_status interrupting
+    kill_child_group
+    exit 130
+  fi
   if (( progress_confirmed )); then
     {
       echo "agent-fanout: wrapper interrupted after progress; codex is still running"
@@ -194,6 +247,14 @@ on_signal() {
 }
 trap on_signal INT TERM HUP
 
+on_force_cancel() {
+  final_state_override=cancelled
+  set_lane_status cancelling
+  kill_child_group
+  exit 125
+}
+trap on_force_cancel USR1
+
 (
   cd "$worktree"
   exec perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
@@ -201,6 +262,12 @@ trap on_signal INT TERM HUP
 ) >"$event_log" 2>"$run_log" </dev/null &
 child_pid=$!
 child_pgid=$child_pid
+if [[ -n "$state_dir" ]]; then
+  atomic_write "$state_dir/child.pid" "$child_pid"
+  atomic_write "$state_dir/child.pgid" "$child_pgid"
+  atomic_write "$state_dir/child.start" "$(ps -o lstart= -p "$child_pid" | sed 's/^ *//;s/ *$//')"
+  set_lane_status running
+fi
 
 echo "agent-fanout: launched codex pid=$child_pid worktree=$worktree"
 echo "agent-fanout: startup timeout=${startup_timeout}s quiet timeout=${quiet_timeout}s run_log=$run_log event_log=$event_log result=$result"
@@ -351,6 +418,7 @@ while kill -0 "$child_pid" 2>/dev/null; do
     write_diagnostic_result "no child progress before startup timeout: no codex --json progress event, no result file, and no worktree diff"
     kill_child_group
     wait "$child_pid" 2>/dev/null || true
+    final_state_override=failed
     exit 124
   fi
 
@@ -359,6 +427,7 @@ while kill -0 "$child_pid" 2>/dev/null; do
     write_diagnostic_result "no child progress for ${quiet_timeout}s after: ${last_progress_signal:-unknown}"
     kill_child_group
     wait "$child_pid" 2>/dev/null || true
+    final_state_override=failed
     exit 124
   fi
 

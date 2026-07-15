@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: launch-command-lane --worktree DIR --state-dir DIR --result FILE --run-log FILE -- COMMAND [ARG...]
+
+Run a generic headless lane under the durable agent-fanout lifecycle. Command
+stdout becomes the result file and stderr becomes the run log.
+EOF
+}
+
+worktree=
+state_dir=
+result=
+run_log=
+
+while (($#)); do
+  case "$1" in
+    --worktree) worktree=${2:-}; shift 2 ;;
+    --state-dir) state_dir=${2:-}; shift 2 ;;
+    --result) result=${2:-}; shift 2 ;;
+    --run-log) run_log=${2:-}; shift 2 ;;
+    --) shift; break ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "launch-command-lane: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+done
+
+die() {
+  echo "launch-command-lane: $*" >&2
+  exit 2
+}
+
+[[ -n "$worktree" ]] || die "--worktree is required"
+[[ -n "$state_dir" ]] || die "--state-dir is required"
+[[ -n "$result" ]] || die "--result is required"
+[[ -n "$run_log" ]] || die "--run-log is required"
+(($#)) || die "COMMAND is required after --"
+[[ -d "$worktree" ]] || die "worktree does not exist: $worktree"
+worktree=$(cd "$worktree" && pwd -P)
+git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || die "not a git worktree: $worktree"
+command -v perl >/dev/null 2>&1 || die "perl is required"
+
+mkdir -p "$state_dir" "$(dirname "$result")" "$(dirname "$run_log")"
+rm -f "$result"
+: > "$run_log"
+
+atomic_write() {
+  local file=$1 value=$2 tmp=$1.tmp.$$
+  printf '%s\n' "$value" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+set_status() {
+  atomic_write "$state_dir/status" "$1"
+}
+
+child_pid=
+child_pgid=
+final_state_override=
+
+kill_child_group() {
+  if [[ -n "$child_pid" ]] && kill -0 "$child_pid" 2>/dev/null; then
+    kill -TERM "-${child_pgid:-$child_pid}" 2>/dev/null || true
+    sleep 2
+    kill -KILL "-${child_pgid:-$child_pid}" 2>/dev/null || true
+  fi
+}
+
+on_exit() {
+  local code=$?
+  atomic_write "$state_dir/exit-code" "$code"
+  case "$final_state_override" in
+    cancelled|interrupted) set_status "$final_state_override" ;;
+    *)
+      if (( code == 0 )); then set_status succeeded; else set_status failed; fi
+      ;;
+  esac
+}
+trap on_exit EXIT
+
+on_interrupt() {
+  final_state_override=interrupted
+  set_status interrupting
+  kill_child_group
+  exit 130
+}
+trap on_interrupt INT TERM HUP
+
+on_cancel() {
+  final_state_override=cancelled
+  set_status cancelling
+  kill_child_group
+  exit 125
+}
+trap on_cancel USR1
+
+atomic_write "$state_dir/wrapper.pid" "$$"
+atomic_write "$state_dir/wrapper.start" "$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')"
+atomic_write "$state_dir/worktree" "$worktree"
+atomic_write "$state_dir/result" "$result"
+atomic_write "$state_dir/run-log" "$run_log"
+set_status dispatching
+
+(
+  cd "$worktree"
+  exec perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' "$@"
+) > "$result" 2> "$run_log" </dev/null &
+child_pid=$!
+child_pgid=$child_pid
+atomic_write "$state_dir/child.pid" "$child_pid"
+atomic_write "$state_dir/child.pgid" "$child_pgid"
+atomic_write "$state_dir/child.start" "$(ps -o lstart= -p "$child_pid" | sed 's/^ *//;s/ *$//')"
+set_status running
+
+set +e
+wait "$child_pid"
+child_status=$?
+set -e
+exit "$child_status"

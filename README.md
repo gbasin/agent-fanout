@@ -1,6 +1,8 @@
 # agent-fanout
 
-Delegate implementation work to parallel headless agent-CLI subagents — codex by default, or omp with a cheap model like Gemini Flash — in persistent git worktrees, with the orchestrating agent planning the phases, writing the briefs, reviewing every diff, merging, and owning final verification.
+Delegate implementation work to parallel headless agent CLIs in persistent Git
+worktrees. The orchestrating agent plans the phases, reviews every diff, merges,
+and owns final verification.
 
 ## Install
 
@@ -8,45 +10,87 @@ Delegate implementation work to parallel headless agent-CLI subagents — codex 
 npx skills add gbasin/agent-fanout --all -g
 ```
 
-## What it does
+## Durable controller
 
-The runners do the volume work — cheaper and faster, reviewed before anything lands. The skill encodes the working recipe for orchestrating them:
-
-1. **The orchestrator runs in its own integration worktree** — created from the freshly fetched remote target branch, never the primary checkout, so several orchestrators can fan out on one machine/repo at once; every branch, `.worktrees/` path, and `/tmp` artifact is session-namespaced, and main is touched only by the final atomic merge/PR
-2. **Foundation first** — if the work needs shared conventions, run one task, review, commit, then fan out
-3. **Disjoint ownership** — each parallel phase owns specific files or functions; shared-file additions go in marked appendix blocks so merges stay trivial
-4. **Persistent worktrees, launched through a Codex progress watchdog** — completion is still process exit, but dead-started or quiet-wedged Codex lanes fail fast instead of sitting alive for hours with only startup events
-5. **No status-polling watcher loops** — the launch wrapper supervises child-bound progress; the background-task notification remains the "done/failed" signal
-6. **Patch-based review and merge** — read every diff, `git apply --3way`, re-test after each apply
-7. **Final QA + land-green belongs to the orchestrator** — runner screenshots are a first-line filter, not a sign-off; the orchestrator drives the full suite (build, unit, **e2e**) to green, then lands the integration branch on green CI (PR + wait-for-checks if the repo has a remote, else a local merge gated by that local suite), and sweeps its own — plus any git-proven-dead — worktrees and branches
-
-Mixed fleets are fine: codex for phases needing judgment, omp + Gemini Flash for mechanical ones. Any agent CLI that runs headless, exits on completion, and works against the current directory can slot in.
-
-## Why it's shaped this way
-
-Distilled postmortem — a real orchestration session hit every failure mode at least once:
-
-- Harness-managed worktree isolation reaped the worktree out from under a still-running async codex task, orphaning it in a deleted directory
-- Job-status watchers parsed "no job found" (per-directory job state, checked from the wrong directory) as "finished"
-- A codex task wedged before its first real event: the process was alive with only `session_meta` + `task_started`, no result file, and no worktree diff
-- The first startup watchdog falsely accepted the parent/orchestrator transcript because the launch command contained the runner worktree path; liveness now comes from the child `codex exec --json` stream plus result/worktree changes, and rollout files are only diagnostics when their `session_meta.cwd` exactly matches the lane worktree
-- A codex task wedged for ~2 hours *after* completing its work, retrying browser fallbacks its sandbox could never satisfy
-- Embedded worktree gitlinks snuck into a commit via `git add -A`; the procedure excludes `.worktrees/` before creating nested worktrees
-
-## The visual QA trick
-
-Headless codex under the macOS seatbelt sandbox *cannot launch* a browser (Chrome dies at Mach-port registration). But it can *drive* one: pre-start the [dev-browser](https://github.com/gbasin/dev-browser) daemon outside the sandbox and launch the lane through `scripts/launch-codex-lane`, which passes the required network flag by default:
+All lane lifecycle operations go through `scripts/agent-fanout`:
 
 ```bash
-scripts/launch-codex-lane --worktree "$WT" --brief "$BRIEF" --result "$RESULT" --run-log "$RUN_LOG"
+AF=/absolute/path/to/agent-fanout/scripts/agent-fanout
+
+$AF init --repo /path/to/repo
+$AF add-lane --run <run-id> --phase api
+$AF start --run <run-id> --phase api --brief /path/to/api-brief.md --runner codex
+$AF status --run <run-id>
+$AF wait --run <run-id> --phase api --timeout 60
+$AF collect --run <run-id> --phase api
 ```
 
-The socket connect succeeds, screenshots are written daemon-side, and codex reads the PNGs back to visually verify its own work. Both halves are required — without the network flag the connect is blocked even with the daemon running. Unsandboxed runners (omp) can drive the daemon directly, but pre-starting it still avoids auto-start races between parallel tasks.
+The controller owns the process backend, per-run isolation, worktree creation,
+durable state, process-group cancellation, and cleanup. Orchestrators work with
+semantic states—`created`, `dispatching`, `running`, `succeeded`, `failed`,
+`cancelled`, and `interrupted`—rather than tmux sessions or PIDs. `debug` and
+`attach` exist only as maintainer/human escape hatches.
+
+This avoids relying on a host harness's background-task lifetime. Starting a
+lane is a short foreground dispatch; after that, the controller-owned supervisor
+survives the orchestrator process and records terminal state on disk.
+
+## Isolation and concurrency
+
+- Every run has a globally unique ID, its own integration worktree, and its own
+  supervisor server.
+- Every lane has a distinct branch, worktree, state directory, and process group.
+- Short shared Git mutations are serialized with a per-repository lock.
+- Cancellation validates recorded process identity before targeting the lane's
+  process group.
+- Cleanup is run-scoped and refuses live lanes unless explicitly forced.
+
+Separate orchestrators can therefore fan out in the same repository—or use the
+same phase names—without sharing supervisor namespaces. There is intentionally
+no machine-wide concurrency limit; callers remain responsible for CPU, memory,
+API quota, and provider rate limits.
+
+## Runners
+
+- `codex` (default): launches `codex exec` through the bundled progress watchdog.
+- `omp`: launches `omp -p --no-session --auto-approve`; scope briefs tightly
+  because it is unsandboxed.
+- `command`: supervises an arbitrary headless command, useful for testing or
+  integrating another agent CLI.
+
+Codex lanes enable workspace-write network access by default and detect dead
+starts or quiet wedges from the child JSON stream, result file, and worktree
+progress. Completion notifications are not part of correctness; use `status`,
+bounded `wait`, and `collect` after a restart.
+
+## Visual QA
+
+Headless Codex under the macOS seatbelt cannot launch Chrome, but it can drive a
+pre-started [dev-browser](https://github.com/gbasin/dev-browser) daemon. Warm the
+daemon from the orchestrator, give each lane a run-prefixed browser name and a
+unique port, then launch the lane through the controller. The Codex launcher
+passes the required network flag by default.
+
+## Tests
+
+```bash
+scripts/test-agent-fanout
+scripts/test-launch-codex-lane
+```
+
+The controller suite uses disposable repositories and exercises concurrent
+initialization, linked-worktree discovery, duplicate run rejection, same-named
+lanes in independent runs, durable failure, forced cancellation, supervisor
+loss, and cleanup isolation.
 
 ## Requirements
 
-- At least one runner CLI with auth configured: Codex CLI (`codex exec`) and/or omp (`omp /login` once, or a provider key such as `GEMINI_API_KEY`)
-- Optional, for visual QA: [dev-browser](https://github.com/gbasin/dev-browser)
+- Git, tmux, Perl, and standard macOS/Linux command-line tools
+- At least one authenticated runner: Codex CLI and/or OMP (`omp /login`, or a
+  provider key such as `GEMINI_API_KEY`)
+- Optional for visual QA: [dev-browser](https://github.com/gbasin/dev-browser)
+
+See [SKILL.md](SKILL.md) for the complete orchestration and review workflow.
 
 ## License
 

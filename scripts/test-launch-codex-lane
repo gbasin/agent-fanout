@@ -201,6 +201,17 @@ wait_for() {  # wait_for <timeout-sec> <cmd...>
   done
 }
 
+kill_test_child() {
+  local pid=$1 pgid self_pgid
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  self_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
+  if [[ "$pgid" =~ ^[0-9]+$ && "$pgid" == "$pid" && "$pgid" != "$self_pgid" ]]; then
+    kill -KILL "-$pgid" 2>/dev/null || true
+  else
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+}
+
 # Signal the wrapper mid-run and check the child's fate. Uses SIGTERM because
 # backgrounded jobs enter with SIGINT ignored (the launcher traps INT/TERM/HUP
 # with one handler, so TERM exercises the same path).
@@ -258,16 +269,70 @@ run_signal_case() {
       exit 1
     fi
     assert_contains "$err" "codex is still running"
-    kill -KILL "-$fake_pid" 2>/dev/null || kill -KILL "$fake_pid" 2>/dev/null || true
+    kill_test_child "$fake_pid"
   else
     if kill -0 "$fake_pid" 2>/dev/null; then
       echo "case $name: child survived but should have been killed pre-startup" >&2
-      kill -KILL "-$fake_pid" 2>/dev/null || true
+      kill_test_child "$fake_pid"
       exit 1
     fi
   fi
 
   printf 'ok %-18s exit=%s\n' "$name" "$status"
+}
+
+run_durable_state_case() {
+  local name=$1 mode=$2 action=$3 expected_exit=$4 expected_state=$5
+  local case_dir=$TMP/$name
+  local repo=$case_dir/repo fake=$case_dir/fake-codex
+  local result=$case_dir/result.md run_log=$case_dir/run.log brief=$case_dir/brief.md
+  local pid_file=$case_dir/fake.pid state=$case_dir/state out=$case_dir/wrapper.out err=$case_dir/wrapper.err
+  mkdir -p "$case_dir"
+  make_repo "$repo"
+  make_fake_codex "$fake"
+  printf 'test brief for %s\n' "$name" > "$brief"
+
+  CODEX_HOME="$case_dir/codex-home" FAKE_CODEX_MODE="$mode" FAKE_CODEX_PID_FILE="$pid_file" \
+    "$LAUNCHER" \
+      --worktree "$repo" --brief "$brief" --result "$result" --run-log "$run_log" \
+      --state-dir "$state" --codex-bin "$fake" --startup-timeout 60 --quiet-timeout 60 \
+      --poll-interval 1 > "$out" 2> "$err" &
+  local wrapper_pid=$!
+
+  if ! wait_for 20 test -s "$state/child.pid"; then
+    echo "case $name: durable child metadata was not published" >&2
+    kill -KILL "$wrapper_pid" 2>/dev/null || true
+    exit 1
+  fi
+  assert_contains "$state/worktree" "$(cd "$repo" && pwd -P)"
+  if [[ "$action" == cancel ]]; then
+    if ! wait_for 20 grep -q "progress confirmed" "$out"; then
+      echo "case $name: progress was not confirmed before cancellation" >&2
+      kill -KILL "$wrapper_pid" 2>/dev/null || true
+      exit 1
+    fi
+    kill -USR1 "$wrapper_pid"
+  fi
+
+  set +e
+  wait "$wrapper_pid"
+  local status=$?
+  set -e
+  if [[ "$status" -ne "$expected_exit" ]]; then
+    echo "case $name: expected exit $expected_exit, got $status" >&2
+    cat "$out" "$err" >&2
+    exit 1
+  fi
+  assert_contains "$state/status" "$expected_state"
+  assert_contains "$state/exit-code" "$expected_exit"
+  local child_pid
+  child_pid=$(<"$state/child.pid")
+  if kill -0 "$child_pid" 2>/dev/null; then
+    echo "case $name: durable child still alive after terminal state: $child_pid" >&2
+    kill_test_child "$child_pid"
+    exit 1
+  fi
+  printf 'ok %-18s exit=%s state=%s\n' "$name" "$status" "$expected_state"
 }
 
 bash -n "$LAUNCHER"
@@ -282,5 +347,7 @@ run_case stderr-progress stderr-progress 0
 run_case early-exit early-exit 1 "codex exited before any child progress signal"
 run_signal_case signal-pre-start dead-start 0 0
 run_signal_case signal-post-start confirmed-hang 1 1
+run_durable_state_case durable-success json-start wait 0 succeeded
+run_durable_state_case durable-cancel confirmed-hang cancel 125 cancelled
 
 echo "all launch-codex-lane tests passed"
