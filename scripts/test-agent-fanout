@@ -139,6 +139,11 @@ echo "case: JSON status is valid and semantic"
 run_ctl status --run run-a --json > "$TMP/status.json"
 perl -MJSON::PP -0777 -e '$v=decode_json(<>); die unless $v->{lanes}[0]{status} eq "succeeded"' < "$TMP/status.json"
 
+echo "case: human-readable status returns success"
+run_ctl status --run run-a > "$TMP/status.txt"
+assert_file_contains "$TMP/status.txt" $'RUN\tPHASE\tSTATUS\tWORKTREE'
+assert_file_contains "$TMP/status.txt" $'run-a\tlane\tsucceeded\t'
+
 echo "case: failed child exit is durable after tmux session disappears"
 run_ctl add-lane --run run-a --phase failing >/dev/null
 run_ctl start --run run-a --phase failing --brief "$BRIEF" --runner command -- "$FAKE" fail
