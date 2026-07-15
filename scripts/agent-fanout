@@ -395,6 +395,7 @@ emit_status() {
     fi
   done < <(find "$RUN_DIR/lanes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
   (( json )) && printf ']}\n'
+  return 0
 }
 
 cmd_status() {
