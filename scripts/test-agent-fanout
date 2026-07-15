@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+CTL=$ROOT/scripts/agent-fanout
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/agent-fanout-controller-test.XXXXXX")
+STATE=$TMP/state
+REPO=$TMP/repo
+
+cleanup() {
+  local socket
+  if [[ -d "$STATE/runs" ]]; then
+    while IFS= read -r socket; do
+      [[ -n "$socket" ]] && tmux -L "$socket" kill-server 2>/dev/null || true
+    done < <(find "$STATE/runs" -name tmux-socket -type f -exec cat {} \; 2>/dev/null)
+  fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+fail() {
+  echo "FAIL: $*" >&2
+  exit 1
+}
+
+assert_eq() {
+  [[ "$1" == "$2" ]] || fail "expected '$2', got '$1': $3"
+}
+
+assert_file_contains() {
+  grep -Fq "$2" "$1" || fail "expected $1 to contain: $2"
+}
+
+wait_for() {
+  local timeout=$1; shift
+  local deadline=$((SECONDS + timeout))
+  until "$@" 2>/dev/null; do
+    (( SECONDS < deadline )) || return 1
+    sleep 0.1
+  done
+}
+
+run_ctl() {
+  AGENT_FANOUT_STATE_HOME=$STATE "$CTL" "$@"
+}
+
+run_dir() {
+  find "$STATE/runs" -mindepth 2 -maxdepth 2 -type d -name "$1" -print -quit
+}
+
+lane_status_is() {
+  local run=$1 phase=$2 expected=$3 dir
+  dir=$(run_dir "$run")
+  [[ -f "$dir/lanes/$phase/status" ]] && [[ $(<"$dir/lanes/$phase/status") == "$expected" ]]
+}
+
+mkdir -p "$REPO"
+REPO=$(cd "$REPO" && pwd -P)
+git -C "$REPO" init -q
+git -C "$REPO" config user.email test@example.invalid
+git -C "$REPO" config user.name "Agent Fanout Test"
+printf 'base\n' > "$REPO/file.txt"
+git -C "$REPO" add file.txt
+git -C "$REPO" commit -q -m init
+
+CALLER=$TMP/caller
+git -C "$REPO" worktree add -q "$CALLER" -b caller
+CALLER=$(cd "$CALLER" && pwd -P)
+
+FAKE=$TMP/fake-runner
+cat > "$FAKE" <<'FAKE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+mode=$1
+case "$mode" in
+  success) sleep "${2:-2}"; printf 'runner-success\n' ;;
+  fail) printf 'runner-failure\n'; exit 7 ;;
+  hang) while :; do sleep 10; done ;;
+  *) exit 64 ;;
+esac
+FAKE
+chmod +x "$FAKE"
+BRIEF=$TMP/brief.md
+printf 'test brief\n' > "$BRIEF"
+
+echo "case: canonical primary worktree from linked-worktree invocation"
+run_ctl init --repo "$CALLER" --sid run-a > "$TMP/init-a.out"
+RUN_A=$(run_dir run-a)
+assert_eq "$(<"$RUN_A/main")" "$REPO" "canonical primary"
+assert_eq "$(<"$RUN_A/invoking-worktree")" "$CALLER" "invoking worktree"
+assert_eq "$(<"$RUN_A/integration-worktree")" "$REPO/.worktrees/_int-run-a" "integration location"
+[[ -d "$REPO/.worktrees/_int-run-a" ]] || fail "integration worktree not created under primary"
+
+echo "case: atomic run-id collision refusal"
+if run_ctl init --repo "$REPO" --sid run-a > /dev/null 2>&1; then
+  fail "duplicate run id was accepted"
+fi
+
+echo "case: failed initialization remains diagnosable and cleanable"
+printf 'dirty\n' > "$REPO/untracked.txt"
+if run_ctl init --repo "$REPO" --sid run-failed > /dev/null 2>&1; then
+  fail "dirty local-only repository unexpectedly initialized"
+fi
+rm "$REPO/untracked.txt"
+RUN_FAILED=$(run_dir run-failed)
+assert_eq "$(<"$RUN_FAILED/status")" failed "failed initialization status"
+assert_eq "$(<"$RUN_FAILED/integration-worktree")" \
+  "$REPO/.worktrees/_int-run-failed" "failed initialization metadata"
+run_ctl cleanup --run run-failed --drop-worktrees --force >/dev/null
+assert_eq "$(<"$RUN_FAILED/status")" cleaned "failed initialization cleanup"
+
+echo "case: concurrent init is serialized by repository lock"
+run_ctl init --repo "$REPO" --sid run-b > "$TMP/init-b.out" & p1=$!
+run_ctl init --repo "$REPO" --sid run-c > "$TMP/init-c.out" & p2=$!
+wait "$p1"; wait "$p2"
+RUN_B=$(run_dir run-b)
+RUN_C=$(run_dir run-c)
+[[ -d "$(<"$RUN_B/integration-worktree")" && -d "$(<"$RUN_C/integration-worktree")" ]] \
+  || fail "concurrent integration worktrees were not created"
+
+echo "case: identical phase names coexist across per-run tmux servers"
+run_ctl add-lane --run run-a --phase lane > "$TMP/lane-a.out"
+run_ctl add-lane --run run-b --phase lane > "$TMP/lane-b.out"
+run_ctl start --run run-a --phase lane --brief "$BRIEF" --runner command -- "$FAKE" success 3
+run_ctl start --run run-b --phase lane --brief "$BRIEF" --runner command -- "$FAKE" success 3
+wait_for 10 lane_status_is run-a lane running || fail "run-a lane never started"
+wait_for 10 lane_status_is run-b lane running || fail "run-b lane never started"
+SOCKET_A=$(<"$RUN_A/tmux-socket")
+SOCKET_B=$(<"$RUN_B/tmux-socket")
+[[ "$SOCKET_A" != "$SOCKET_B" ]] || fail "runs shared a tmux socket"
+tmux -L "$SOCKET_A" has-session -t '=lane' || fail "run-a tmux lane missing"
+tmux -L "$SOCKET_B" has-session -t '=lane' || fail "run-b tmux lane missing"
+run_ctl wait --run run-a --phase lane --timeout 10 >/dev/null
+run_ctl wait --run run-b --phase lane --timeout 10 >/dev/null
+assert_file_contains "$RUN_A/lanes/lane/result.md" runner-success
+assert_file_contains "$RUN_B/lanes/lane/result.md" runner-success
+
+echo "case: JSON status is valid and semantic"
+run_ctl status --run run-a --json > "$TMP/status.json"
+perl -MJSON::PP -0777 -e '$v=decode_json(<>); die unless $v->{lanes}[0]{status} eq "succeeded"' < "$TMP/status.json"
+
+echo "case: failed child exit is durable after tmux session disappears"
+run_ctl add-lane --run run-a --phase failing >/dev/null
+run_ctl start --run run-a --phase failing --brief "$BRIEF" --runner command -- "$FAKE" fail
+set +e
+run_ctl wait --run run-a --phase failing --timeout 10 > "$TMP/fail-status"
+fail_wait=$?
+set -e
+[[ "$fail_wait" -ne 0 ]] || fail "failed lane wait returned success"
+assert_eq "$(<"$TMP/fail-status")" failed "failed lane status"
+assert_eq "$(<"$RUN_A/lanes/failing/exit-code")" 7 "failed lane exit code"
+
+echo "case: explicit cancellation kills the child process group"
+run_ctl add-lane --run run-a --phase cancel >/dev/null
+run_ctl start --run run-a --phase cancel --brief "$BRIEF" --runner command -- "$FAKE" hang
+wait_for 10 lane_status_is run-a cancel running || fail "cancel lane never started"
+CHILD=$(<"$RUN_A/lanes/cancel/child.pid")
+run_ctl cancel --run run-a --phase cancel --grace 5 > "$TMP/cancel-status"
+assert_eq "$(<"$TMP/cancel-status")" cancelled "cancel status"
+if kill -0 "$CHILD" 2>/dev/null; then fail "cancelled child is still alive: $CHILD"; fi
+
+echo "case: tmux server loss becomes interrupted and does not orphan child"
+run_ctl add-lane --run run-c --phase interrupted >/dev/null
+run_ctl start --run run-c --phase interrupted --brief "$BRIEF" --runner command -- "$FAKE" hang
+wait_for 10 lane_status_is run-c interrupted running || fail "interrupt lane never started"
+INT_CHILD=$(<"$RUN_C/lanes/interrupted/child.pid")
+tmux -L "$(<"$RUN_C/tmux-socket")" kill-server
+wait_for 10 lane_status_is run-c interrupted interrupted || fail "server loss did not persist interrupted"
+if kill -0 "$INT_CHILD" 2>/dev/null; then fail "interrupted child is still alive: $INT_CHILD"; fi
+
+echo "case: cleanup is isolated per run"
+run_ctl cleanup --run run-a --drop-worktrees --force >/dev/null
+[[ ! -d "$REPO/.worktrees/_int-run-a" ]] || fail "run-a integration worktree survived cleanup"
+[[ -d "$(<"$RUN_B/integration-worktree")" ]] || fail "run-a cleanup removed run-b integration worktree"
+[[ $(<"$RUN_B/status") == active ]] || fail "run-a cleanup changed run-b state"
+
+run_ctl cleanup --run run-b --drop-worktrees --force >/dev/null
+run_ctl cleanup --run run-c --drop-worktrees --force >/dev/null
+git -C "$REPO" worktree remove "$CALLER" --force
+git -C "$REPO" branch -D caller >/dev/null
+
+echo "all agent-fanout controller tests passed"

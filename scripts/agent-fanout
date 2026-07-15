@@ -1,0 +1,624 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
+CODEX_LAUNCHER=$ROOT/scripts/launch-codex-lane
+COMMAND_LAUNCHER=$ROOT/scripts/launch-command-lane
+STATE_HOME=${AGENT_FANOUT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-fanout}
+LOCK_DIR=
+
+usage() {
+  cat <<'EOF'
+Usage: agent-fanout COMMAND [options]
+
+Commands:
+  init       Claim a run and create its integration worktree
+  add-lane   Create a persistent runner worktree
+  start      Start a durable Codex, OMP, or generic command lane
+  status     Show semantic lane state (add --json for machine output)
+  list       List known runs
+  wait       Wait briefly for one lane to reach a terminal state
+  logs       Tail a lane's logs
+  collect    Print a lane result and artifact paths
+  cancel     Explicitly cancel a lane and its child process group
+  cleanup    Stop a run; optionally remove its owned worktrees/branches
+  debug      Show backend diagnostics
+  attach     Human escape hatch: attach to a lane's tmux pane
+
+Run `agent-fanout COMMAND --help` for command-specific usage.
+EOF
+}
+
+die() {
+  echo "agent-fanout: $*" >&2
+  exit 2
+}
+
+atomic_write() {
+  local file=$1 value=$2 tmp=$1.tmp.$$
+  mkdir -p "$(dirname "$file")"
+  printf '%s\n' "$value" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+read_file() {
+  [[ -f "$1" ]] && cat "$1"
+}
+
+json_quote() {
+  perl -MJSON::PP -e 'print encode_json($ARGV[0])' "$1"
+}
+
+is_terminal() {
+  case "$1" in
+    succeeded|failed|cancelled|interrupted) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+random_suffix() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 4
+  else
+    od -An -N4 -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
+canonical_repo() {
+  local from=${1:-$PWD}
+  git -C "$from" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "not inside a git worktree: $from"
+  CURRENT=$(git -C "$from" rev-parse --show-toplevel)
+  MAIN=$(git -C "$from" worktree list --porcelain \
+    | awk 'NR==1{sub(/^worktree /,""); print; exit}')
+  [[ -n "$MAIN" && -d "$MAIN" ]] || die "could not locate primary worktree"
+  COMMON_DIR=$(git -C "$from" rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
+    || (cd "$from" && cd "$(git rev-parse --git-common-dir)" && pwd -P))
+  REPO_ID=$(printf '%s' "$COMMON_DIR" | shasum -a 256 | cut -c1-12)
+}
+
+lock_owner_alive() {
+  local lock=$1 pid expected actual
+  pid=$(read_file "$lock/pid")
+  expected=$(read_file "$lock/start")
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  actual=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//;s/ *$//')
+  [[ -n "$expected" && "$actual" == "$expected" ]]
+}
+
+acquire_repo_lock() {
+  local repo_id=$1 deadline=$((SECONDS + 30)) stale candidate incomplete_checks=0
+  mkdir -p "$STATE_HOME/locks"
+  candidate=$STATE_HOME/locks/$repo_id.lock
+  while ! mkdir "$candidate" 2>/dev/null; do
+    if lock_owner_alive "$candidate"; then
+      incomplete_checks=0
+    elif [[ ! -f "$candidate/pid" || ! -f "$candidate/start" ]] && (( incomplete_checks < 50 )); then
+      # mkdir is the ownership claim. Give its owner time to publish identity
+      # before considering an incomplete lock stale.
+      ((incomplete_checks += 1))
+    else
+      stale=$candidate.stale.$$
+      if mv "$candidate" "$stale" 2>/dev/null; then rm -rf "$stale"; fi
+      incomplete_checks=0
+      continue
+    fi
+    (( SECONDS < deadline )) || die "timed out waiting for repository lock: $candidate"
+    sleep 0.1
+  done
+  LOCK_DIR=$candidate
+  atomic_write "$LOCK_DIR/pid" "$$"
+  atomic_write "$LOCK_DIR/start" "$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')"
+}
+
+release_repo_lock() {
+  if [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then rm -rf "$LOCK_DIR"; fi
+  LOCK_DIR=
+}
+
+on_exit() {
+  local code=$?
+  release_repo_lock
+  if (( code != 0 )) && [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR:-}" ]] \
+    && [[ "$(read_file "$RUN_DIR/status")" == initializing ]]; then
+    atomic_write "$RUN_DIR/status" failed
+  fi
+}
+trap on_exit EXIT
+
+resolve_run() {
+  local value=$1 matches
+  if [[ -d "$value" && -f "$value/sid" ]]; then
+    RUN_DIR=$(cd "$value" && pwd -P)
+  else
+    matches=$(find "$STATE_HOME/runs" -mindepth 2 -maxdepth 2 -type d -name "$value" 2>/dev/null || true)
+    [[ -n "$matches" ]] || die "run not found: $value"
+    [[ $(printf '%s\n' "$matches" | wc -l | tr -d ' ') == 1 ]] \
+      || die "run id is ambiguous; pass its absolute state directory: $value"
+    RUN_DIR=$matches
+  fi
+  SID=$(read_file "$RUN_DIR/sid")
+  REPO_ID=$(read_file "$RUN_DIR/repo-id")
+  MAIN=$(read_file "$RUN_DIR/main")
+  INT=$(read_file "$RUN_DIR/integration-worktree")
+  SOCKET=$(read_file "$RUN_DIR/tmux-socket")
+  [[ -n "$SID" && -n "$REPO_ID" && -n "$MAIN" && -n "$INT" && -n "$SOCKET" ]] \
+    || die "run metadata is incomplete: $RUN_DIR"
+}
+
+lane_dir() {
+  printf '%s/lanes/%s' "$RUN_DIR" "$1"
+}
+
+resolve_lane() {
+  local phase=$1
+  valid_name "$phase" || die "invalid phase name: $phase"
+  LANE_DIR=$(lane_dir "$phase")
+  [[ -d "$LANE_DIR" ]] || die "lane not found: $phase"
+  LANE_WORKTREE=$(read_file "$LANE_DIR/worktree")
+  [[ -n "$LANE_WORKTREE" ]] || die "lane metadata is incomplete: $LANE_DIR"
+}
+
+tmux_has_lane() {
+  command -v tmux >/dev/null 2>&1 \
+    && tmux -L "$SOCKET" has-session -t "=$1" 2>/dev/null
+}
+
+pid_matches_start() {
+  local pid=$1 start_file=$2 expected actual
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  expected=$(read_file "$start_file")
+  [[ -n "$expected" ]] || return 1
+  actual=$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//;s/ *$//')
+  [[ "$actual" == "$expected" ]]
+}
+
+refresh_lane() {
+  local phase=$1 status wrapper
+  resolve_lane "$phase"
+  status=$(read_file "$LANE_DIR/status")
+  case "$status" in created|succeeded|failed|cancelled|interrupted) return 0 ;; esac
+  tmux_has_lane "$phase" && return 0
+  wrapper=$(read_file "$LANE_DIR/wrapper.pid")
+  pid_matches_start "$wrapper" "$LANE_DIR/wrapper.start" && return 0
+  sleep 0.1
+  status=$(read_file "$LANE_DIR/status")
+  is_terminal "$status" || atomic_write "$LANE_DIR/status" interrupted
+}
+
+cmd_init() {
+  local repo=$PWD base_ref='' sid='' int branch exclude
+  while (($#)); do
+    case "$1" in
+      --repo) repo=${2:-}; shift 2 ;;
+      --base-ref) base_ref=${2:-}; shift 2 ;;
+      --sid) sid=${2:-}; shift 2 ;;
+      -h|--help)
+        echo "Usage: agent-fanout init [--repo DIR] [--base-ref REF] [--sid ID]"; return 0 ;;
+      *) die "init: unknown argument: $1" ;;
+    esac
+  done
+  command -v tmux >/dev/null 2>&1 || die "tmux is required"
+  command -v perl >/dev/null 2>&1 || die "perl is required"
+  canonical_repo "$repo"
+  mkdir -p "$STATE_HOME/claims" "$STATE_HOME/runs/$REPO_ID"
+  if [[ -n "$sid" ]]; then
+    valid_name "$sid" || die "invalid sid: $sid"
+    mkdir "$STATE_HOME/claims/$sid" 2>/dev/null || die "sid already claimed: $sid"
+  else
+    while :; do
+      sid=$(date +%Y%m%d%H%M%S)-$(random_suffix)
+      if mkdir "$STATE_HOME/claims/$sid" 2>/dev/null; then break; fi
+    done
+  fi
+  SID=$sid
+  RUN_DIR=$STATE_HOME/runs/$REPO_ID/$SID
+  mkdir "$RUN_DIR"
+  atomic_write "$STATE_HOME/claims/$SID/repo-id" "$REPO_ID"
+  atomic_write "$STATE_HOME/claims/$SID/run-dir" "$RUN_DIR"
+  atomic_write "$RUN_DIR/sid" "$SID"
+  atomic_write "$RUN_DIR/repo-id" "$REPO_ID"
+  atomic_write "$RUN_DIR/main" "$MAIN"
+  atomic_write "$RUN_DIR/invoking-worktree" "$CURRENT"
+  SOCKET=af-$REPO_ID-$SID
+  atomic_write "$RUN_DIR/tmux-socket" "$SOCKET"
+  int=$MAIN/.worktrees/_int-$SID
+  branch=int-$SID
+  INT=$int
+  atomic_write "$RUN_DIR/integration-worktree" "$int"
+  atomic_write "$RUN_DIR/integration-branch" "$branch"
+  atomic_write "$RUN_DIR/status" initializing
+
+  acquire_repo_lock "$REPO_ID"
+  exclude=$(git -C "$MAIN" rev-parse --path-format=absolute --git-path info/exclude)
+  if ! grep -qx '.worktrees/' "$exclude" 2>/dev/null; then printf '.worktrees/\n' >> "$exclude"; fi
+  if git -C "$MAIN" remote get-url origin >/dev/null 2>&1; then
+    git -C "$MAIN" fetch --prune origin
+    if [[ -z "$base_ref" ]]; then
+      base_ref=$(git -C "$MAIN" ls-remote --symref origin HEAD \
+        | awk '$1=="ref:"{sub("^refs/heads/","",$2); print "origin/" $2; exit}')
+      [[ -n "$base_ref" ]] || base_ref=$(git -C "$MAIN" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+    fi
+    [[ -n "$base_ref" ]] || die "no origin default branch; pass --base-ref"
+    case "$base_ref" in
+      origin/*) git -C "$MAIN" fetch origin "${base_ref#origin/}:refs/remotes/$base_ref" ;;
+    esac
+  else
+    [[ -z "$(git -C "$MAIN" status --porcelain --untracked-files=normal)" ]] \
+      || die "primary checkout is dirty and no origin exists"
+    [[ -n "$base_ref" ]] || base_ref=HEAD
+  fi
+  git -C "$MAIN" rev-parse --verify "$base_ref^{commit}" >/dev/null \
+    || die "base ref not found: $base_ref"
+  git -C "$MAIN" worktree add "$int" -b "$branch" "$base_ref"
+  git -C "$int" config "branch.$branch.agentFanoutBase" "$base_ref"
+  release_repo_lock
+
+  atomic_write "$RUN_DIR/base-ref" "$base_ref"
+  mkdir -p "$RUN_DIR/lanes"
+  atomic_write "$RUN_DIR/status" active
+  printf 'run=%s\nstate_dir=%s\nintegration_worktree=%s\n' "$SID" "$RUN_DIR" "$int"
+}
+
+cmd_add_lane() {
+  local run='' phase='' lane wt branch
+  while (($#)); do
+    case "$1" in
+      --run) run=${2:-}; shift 2 ;;
+      --phase) phase=${2:-}; shift 2 ;;
+      -h|--help) echo "Usage: agent-fanout add-lane --run ID --phase NAME"; return 0 ;;
+      *) die "add-lane: unknown argument: $1" ;;
+    esac
+  done
+  [[ -n "$run" && -n "$phase" ]] || die "add-lane requires --run and --phase"
+  valid_name "$phase" || die "invalid phase name: $phase"
+  resolve_run "$run"
+  lane=$(lane_dir "$phase")
+  mkdir "$lane" 2>/dev/null || die "lane already exists: $phase"
+  wt=$INT/.worktrees/$SID-$phase
+  branch=wt-$SID-$phase
+  acquire_repo_lock "$REPO_ID"
+  if ! git -C "$MAIN" worktree add "$wt" -b "$branch" "int-$SID"; then
+    release_repo_lock
+    rmdir "$lane" 2>/dev/null || true
+    die "could not create lane worktree"
+  fi
+  release_repo_lock
+  atomic_write "$lane/phase" "$phase"
+  atomic_write "$lane/worktree" "$wt"
+  atomic_write "$lane/branch" "$branch"
+  atomic_write "$lane/status" created
+  printf 'run=%s\nphase=%s\nworktree=%s\n' "$SID" "$phase" "$wt"
+}
+
+cmd_start() {
+  local run='' phase='' brief='' runner=codex model='' reasoning='' thinking='' network=1
+  local -a command_args=() launch=()
+  while (($#)); do
+    case "$1" in
+      --run) run=${2:-}; shift 2 ;;
+      --phase) phase=${2:-}; shift 2 ;;
+      --brief) brief=${2:-}; shift 2 ;;
+      --runner) runner=${2:-}; shift 2 ;;
+      --model) model=${2:-}; shift 2 ;;
+      --reasoning-effort) reasoning=${2:-}; shift 2 ;;
+      --thinking) thinking=${2:-}; shift 2 ;;
+      --no-network) network=0; shift ;;
+      --) shift; command_args=("$@"); break ;;
+      -h|--help)
+        echo "Usage: agent-fanout start --run ID --phase NAME --brief FILE [--runner codex|omp|command] [runner options] [-- COMMAND...]"; return 0 ;;
+      *) die "start: unknown argument: $1" ;;
+    esac
+  done
+  [[ -n "$run" && -n "$phase" && -n "$brief" ]] || die "start requires --run, --phase, and --brief"
+  [[ -f "$brief" ]] || die "brief not found: $brief"
+  resolve_run "$run"
+  resolve_lane "$phase"
+  local status durable_brief result run_log event_log
+  status=$(read_file "$LANE_DIR/status")
+  [[ "$status" == created || "$status" == failed || "$status" == interrupted || "$status" == cancelled ]] \
+    || die "lane cannot start from state: $status"
+  tmux_has_lane "$phase" && die "lane already has a live tmux session: $phase"
+  durable_brief=$LANE_DIR/brief.md
+  result=$LANE_DIR/result.md
+  run_log=$LANE_DIR/run.log
+  event_log=$LANE_DIR/events.jsonl
+  cp "$brief" "$durable_brief"
+  rm -f "$LANE_DIR/cancel.request" "$LANE_DIR/exit-code" \
+    "$LANE_DIR/wrapper.pid" "$LANE_DIR/wrapper.start" \
+    "$LANE_DIR/child.pid" "$LANE_DIR/child.pgid" "$LANE_DIR/child.start"
+
+  case "$runner" in
+    codex)
+      launch=("$CODEX_LAUNCHER" --worktree "$LANE_WORKTREE" --brief "$durable_brief" \
+        --result "$result" --run-log "$run_log" --event-log "$event_log" --state-dir "$LANE_DIR")
+      [[ -n "$model" ]] && launch+=(--model "$model")
+      [[ -n "$reasoning" ]] && launch+=(--reasoning-effort "$reasoning")
+      (( network )) || launch+=(--no-network)
+      ;;
+    omp)
+      command -v omp >/dev/null 2>&1 || die "omp executable not found"
+      command_args=(omp -p --no-session --auto-approve)
+      [[ -n "$model" ]] && command_args+=(--model "$model")
+      [[ -n "$thinking" ]] && command_args+=(--thinking "$thinking")
+      command_args+=("@$durable_brief")
+      launch=("$COMMAND_LAUNCHER" --worktree "$LANE_WORKTREE" --state-dir "$LANE_DIR" \
+        --result "$result" --run-log "$run_log" -- "${command_args[@]}")
+      ;;
+    command)
+      ((${#command_args[@]})) || die "command runner requires COMMAND after --"
+      launch=("$COMMAND_LAUNCHER" --worktree "$LANE_WORKTREE" --state-dir "$LANE_DIR" \
+        --result "$result" --run-log "$run_log" -- "${command_args[@]}")
+      ;;
+    *) die "unsupported runner: $runner" ;;
+  esac
+
+  atomic_write "$LANE_DIR/runner" "$runner"
+  atomic_write "$LANE_DIR/status" dispatching
+  if ! tmux -L "$SOCKET" -f /dev/null new-session -d -s "$phase" "${launch[@]}"; then
+    atomic_write "$LANE_DIR/status" failed
+    die "tmux could not start lane: $phase"
+  fi
+  printf 'run=%s\nphase=%s\nstatus=dispatching\n' "$SID" "$phase"
+}
+
+emit_status() {
+  local json=$1 phase lane status wt result log first=1
+  if (( json )); then
+    printf '{"run":%s,"status":%s,"main":%s,"integration_worktree":%s,"state_dir":%s,"lanes":[' \
+      "$(json_quote "$SID")" "$(json_quote "$(read_file "$RUN_DIR/status")")" \
+      "$(json_quote "$MAIN")" "$(json_quote "$INT")" "$(json_quote "$RUN_DIR")"
+  else
+    printf 'RUN\tPHASE\tSTATUS\tWORKTREE\n'
+  fi
+  while IFS= read -r lane; do
+    phase=$(basename "$lane")
+    refresh_lane "$phase"
+    status=$(read_file "$lane/status")
+    wt=$(read_file "$lane/worktree")
+    result=$(read_file "$lane/result")
+    log=$(read_file "$lane/run-log")
+    if (( json )); then
+      (( first )) || printf ','
+      first=0
+      printf '{"phase":%s,"status":%s,"worktree":%s,"result":%s,"run_log":%s}' \
+        "$(json_quote "$phase")" "$(json_quote "$status")" "$(json_quote "$wt")" \
+        "$(json_quote "$result")" "$(json_quote "$log")"
+    else
+      printf '%s\t%s\t%s\t%s\n' "$SID" "$phase" "$status" "$wt"
+    fi
+  done < <(find "$RUN_DIR/lanes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+  (( json )) && printf ']}\n'
+}
+
+cmd_status() {
+  local run='' json=0
+  while (($#)); do
+    case "$1" in
+      --run) run=${2:-}; shift 2 ;;
+      --json) json=1; shift ;;
+      -h|--help) echo "Usage: agent-fanout status --run ID [--json]"; return 0 ;;
+      *) die "status: unknown argument: $1" ;;
+    esac
+  done
+  [[ -n "$run" ]] || die "status requires --run"
+  resolve_run "$run"
+  emit_status "$json"
+}
+
+cmd_list() {
+  local run sid status repo
+  if (($#)); then
+    case "$1" in
+      -h|--help) echo "Usage: agent-fanout list"; return 0 ;;
+      *) die "list: unknown argument: $1" ;;
+    esac
+  fi
+  printf 'RUN\tSTATUS\tREPO\tSTATE_DIR\n'
+  while IFS= read -r run; do
+    sid=$(read_file "$run/sid"); status=$(read_file "$run/status"); repo=$(read_file "$run/main")
+    printf '%s\t%s\t%s\t%s\n' "$sid" "$status" "$repo" "$run"
+  done < <(find "$STATE_HOME/runs" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | sort)
+}
+
+cmd_wait() {
+  local run='' phase='' timeout=60 deadline status
+  while (($#)); do
+    case "$1" in
+      --run) run=${2:-}; shift 2 ;;
+      --phase) phase=${2:-}; shift 2 ;;
+      --timeout) timeout=${2:-}; shift 2 ;;
+      -h|--help) echo "Usage: agent-fanout wait --run ID --phase NAME [--timeout SEC]"; return 0 ;;
+      *) die "wait: unknown argument: $1" ;;
+    esac
+  done
+  [[ "$timeout" =~ ^[0-9]+$ ]] || die "timeout must be an integer"
+  [[ -n "$run" && -n "$phase" ]] || die "wait requires --run and --phase"
+  resolve_run "$run"; resolve_lane "$phase"
+  deadline=$((SECONDS + timeout))
+  while :; do
+    refresh_lane "$phase"
+    status=$(read_file "$LANE_DIR/status")
+    if is_terminal "$status"; then
+      printf '%s\n' "$status"
+      [[ "$status" == succeeded ]]
+      return
+    fi
+    if (( SECONDS >= deadline )); then printf '%s\n' "$status"; return 3; fi
+    sleep 1
+  done
+}
+
+cmd_logs() {
+  local run='' phase='' lines=50 events=0 file
+  while (($#)); do
+    case "$1" in
+      --run) run=${2:-}; shift 2 ;;
+      --phase) phase=${2:-}; shift 2 ;;
+      --tail) lines=${2:-}; shift 2 ;;
+      --events) events=1; shift ;;
+      -h|--help) echo "Usage: agent-fanout logs --run ID --phase NAME [--tail N] [--events]"; return 0 ;;
+      *) die "logs: unknown argument: $1" ;;
+    esac
+  done
+  [[ "$lines" =~ ^[0-9]+$ ]] || die "tail count must be an integer"
+  [[ -n "$run" && -n "$phase" ]] || die "logs requires --run and --phase"
+  resolve_run "$run"; resolve_lane "$phase"
+  if (( events )); then file=$(read_file "$LANE_DIR/event-log"); else file=$(read_file "$LANE_DIR/run-log"); fi
+  [[ -n "$file" && -f "$file" ]] || return 0
+  tail -n "$lines" "$file"
+}
+
+cmd_collect() {
+  local run='' phase='' result status
+  while (($#)); do
+    case "$1" in
+      --run) run=${2:-}; shift 2 ;;
+      --phase) phase=${2:-}; shift 2 ;;
+      -h|--help) echo "Usage: agent-fanout collect --run ID --phase NAME"; return 0 ;;
+      *) die "collect: unknown argument: $1" ;;
+    esac
+  done
+  [[ -n "$run" && -n "$phase" ]] || die "collect requires --run and --phase"
+  resolve_run "$run"; refresh_lane "$phase"; resolve_lane "$phase"
+  status=$(read_file "$LANE_DIR/status"); result=$(read_file "$LANE_DIR/result")
+  printf 'status=%s\nworktree=%s\nresult=%s\nrun_log=%s\nevent_log=%s\n' \
+    "$status" "$LANE_WORKTREE" "$result" "$(read_file "$LANE_DIR/run-log")" "$(read_file "$LANE_DIR/event-log")"
+  if [[ -n "$result" && -f "$result" ]]; then printf '\n'; cat "$result"; fi
+}
+
+cmd_cancel() {
+  local run='' phase='' grace=10 status wrapper child pgid deadline
+  while (($#)); do
+    case "$1" in
+      --run) run=${2:-}; shift 2 ;;
+      --phase) phase=${2:-}; shift 2 ;;
+      --grace) grace=${2:-}; shift 2 ;;
+      -h|--help) echo "Usage: agent-fanout cancel --run ID --phase NAME [--grace SEC]"; return 0 ;;
+      *) die "cancel: unknown argument: $1" ;;
+    esac
+  done
+  [[ "$grace" =~ ^[0-9]+$ ]] || die "grace must be an integer"
+  [[ -n "$run" && -n "$phase" ]] || die "cancel requires --run and --phase"
+  resolve_run "$run"; refresh_lane "$phase"; resolve_lane "$phase"
+  status=$(read_file "$LANE_DIR/status")
+  if is_terminal "$status"; then printf '%s\n' "$status"; return 0; fi
+  atomic_write "$LANE_DIR/cancel.request" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  wrapper=$(read_file "$LANE_DIR/wrapper.pid")
+  if pid_matches_start "$wrapper" "$LANE_DIR/wrapper.start"; then kill -USR1 "$wrapper" 2>/dev/null || true; fi
+  deadline=$((SECONDS + grace))
+  while (( SECONDS < deadline )); do
+    status=$(read_file "$LANE_DIR/status")
+    is_terminal "$status" && break
+    sleep 0.2
+  done
+  status=$(read_file "$LANE_DIR/status")
+  if ! is_terminal "$status"; then
+    child=$(read_file "$LANE_DIR/child.pid"); pgid=$(read_file "$LANE_DIR/child.pgid")
+    if pid_matches_start "$child" "$LANE_DIR/child.start" && [[ "$pgid" =~ ^[0-9]+$ ]]; then
+      kill -TERM "-$pgid" 2>/dev/null || true; sleep 2; kill -KILL "-$pgid" 2>/dev/null || true
+    fi
+    if pid_matches_start "$wrapper" "$LANE_DIR/wrapper.start"; then kill -TERM "$wrapper" 2>/dev/null || true; fi
+    atomic_write "$LANE_DIR/exit-code" 125
+    atomic_write "$LANE_DIR/status" cancelled
+  fi
+  tmux -L "$SOCKET" kill-session -t "=$phase" 2>/dev/null || true
+  printf '%s\n' "$(read_file "$LANE_DIR/status")"
+}
+
+cmd_debug() {
+  local run='' phase='' pid
+  while (($#)); do
+    case "$1" in --run) run=${2:-}; shift 2 ;; --phase) phase=${2:-}; shift 2 ;;
+      -h|--help) echo "Usage: agent-fanout debug --run ID --phase NAME"; return 0 ;;
+      *) die "debug: unknown argument: $1" ;; esac
+  done
+  [[ -n "$run" && -n "$phase" ]] || die "debug requires --run and --phase"
+  resolve_run "$run"; refresh_lane "$phase"; resolve_lane "$phase"
+  printf 'run_dir=%s\nsocket=%s\nlane_dir=%s\n' "$RUN_DIR" "$SOCKET" "$LANE_DIR"
+  for name in status wrapper.pid child.pid child.pgid exit-code worktree result run-log event-log; do
+    printf '%s=%s\n' "$name" "$(read_file "$LANE_DIR/$name")"
+  done
+  tmux -L "$SOCKET" list-panes -t "=$phase" -F 'tmux_pid=#{pane_pid} command=#{pane_current_command}' 2>/dev/null || true
+  for name in wrapper child; do
+    pid=$(read_file "$LANE_DIR/$name.pid")
+    [[ "$pid" =~ ^[0-9]+$ ]] && ps -o pid,ppid,pgid,sess,etime,stat,command -p "$pid" 2>/dev/null || true
+  done
+}
+
+cmd_attach() {
+  local run='' phase=''
+  while (($#)); do
+    case "$1" in --run) run=${2:-}; shift 2 ;; --phase) phase=${2:-}; shift 2 ;;
+      -h|--help) echo "Usage: agent-fanout attach --run ID --phase NAME"; return 0 ;;
+      *) die "attach: unknown argument: $1" ;; esac
+  done
+  [[ -n "$run" && -n "$phase" ]] || die "attach requires --run and --phase"
+  resolve_run "$run"; resolve_lane "$phase"
+  exec tmux -L "$SOCKET" attach-session -t "=$phase"
+}
+
+cmd_cleanup() {
+  local run='' drop=0 force=0 lane phase status branch
+  while (($#)); do
+    case "$1" in
+      --run) run=${2:-}; shift 2 ;;
+      --drop-worktrees) drop=1; shift ;;
+      --force) force=1; shift ;;
+      -h|--help) echo "Usage: agent-fanout cleanup --run ID [--drop-worktrees --force]"; return 0 ;;
+      *) die "cleanup: unknown argument: $1" ;;
+    esac
+  done
+  [[ -n "$run" ]] || die "cleanup requires --run"
+  resolve_run "$run"
+  while IFS= read -r lane; do
+    phase=$(basename "$lane"); refresh_lane "$phase"; status=$(read_file "$lane/status")
+    if ! is_terminal "$status" && [[ "$status" != created ]]; then
+      (( force )) || die "lane is still active: $phase"
+      cmd_cancel --run "$RUN_DIR" --phase "$phase"
+    fi
+  done < <(find "$RUN_DIR/lanes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+  tmux -L "$SOCKET" kill-server 2>/dev/null || true
+  if (( drop )); then
+    (( force )) || die "--drop-worktrees requires --force acknowledgment"
+    acquire_repo_lock "$REPO_ID"
+    while IFS= read -r lane; do
+      phase=$(basename "$lane"); resolve_lane "$phase"; branch=$(read_file "$lane/branch")
+      git -C "$MAIN" worktree remove "$LANE_WORKTREE" --force 2>/dev/null || true
+      git -C "$MAIN" branch -D "$branch" 2>/dev/null || true
+    done < <(find "$RUN_DIR/lanes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
+    branch=$(read_file "$RUN_DIR/integration-branch")
+    git -C "$MAIN" worktree remove "$INT" --force 2>/dev/null || true
+    git -C "$MAIN" branch -D "$branch" 2>/dev/null || true
+    git -C "$MAIN" worktree prune
+    release_repo_lock
+  fi
+  atomic_write "$RUN_DIR/status" cleaned
+  printf 'cleaned\n'
+}
+
+command=${1:-}
+[[ -n "$command" ]] || { usage; exit 2; }
+shift
+case "$command" in
+  init) cmd_init "$@" ;;
+  add-lane) cmd_add_lane "$@" ;;
+  start) cmd_start "$@" ;;
+  status) cmd_status "$@" ;;
+  list) cmd_list "$@" ;;
+  wait) cmd_wait "$@" ;;
+  logs) cmd_logs "$@" ;;
+  collect) cmd_collect "$@" ;;
+  cancel) cmd_cancel "$@" ;;
+  cleanup) cmd_cleanup "$@" ;;
+  debug) cmd_debug "$@" ;;
+  attach) cmd_attach "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "unknown command: $command" ;;
+esac
