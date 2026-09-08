@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Validate a clean Git commit with ordered steps and bounded infrastructure recovery."""
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -38,9 +39,17 @@ def main():
     timeout = job.get('step_timeout', 1800)
     if not isinstance(timeout, (int, float)) or timeout <= 0:
         parser.error('step_timeout must be positive')
+    inherit = job.get('inherit_environment', [])
+    if not isinstance(inherit, list) or not all(isinstance(k, str) for k in inherit):
+        parser.error('inherit_environment must be a list of variable names')
     output.mkdir(parents=True, exist_ok=False)
-    env = dict(os.environ, **environment)
-    evidence = {'status': 'running', 'steps': [], 'worktree': str(worktree)}
+    base_keys = ('PATH', 'HOME', 'TMPDIR', 'USER', 'LOGNAME', 'LANG', 'LC_ALL',
+                 'SHELL', 'JAVA_HOME', 'DEVELOPER_DIR')
+    env = {key: os.environ[key] for key in (*base_keys, *inherit) if key in os.environ}
+    env.update(environment)
+    started_at = datetime.now(timezone.utc).isoformat()
+    evidence = {'status': 'running', 'steps': [], 'worktree': str(worktree),
+                'started_at': started_at, 'recovered': False}
 
     def git(*argv):
         return subprocess.check_output(['git', '-C', str(worktree), *argv], text=True).strip()
@@ -48,12 +57,14 @@ def main():
     commit = git('rev-parse', 'HEAD')
     evidence['commit'] = commit
     evidence['configuration_sha256'] = hashlib.sha256(
-        json.dumps(environment, sort_keys=True).encode()).hexdigest()
+        json.dumps(env, sort_keys=True).encode()).hexdigest()
     fingerprint = hashlib.sha256(json.dumps({
         'commit': commit, 'build': job.get('build'), 'verify': job.get('verify'),
-        'environment': environment,
+        'environment': env,
     }, sort_keys=True).encode()).hexdigest()
     evidence['build_fingerprint'] = fingerprint
+    env.update(VALIDATE_RUN_OUTPUT=str(output), VALIDATE_RUN_STARTED_AT=started_at,
+               VALIDATE_RUN_COMMIT=commit, VALIDATE_RUN_BUILD_FINGERPRINT=fingerprint)
     sequence = 0
     cancel_signal = None
 
@@ -105,6 +116,7 @@ def main():
             return 0
         frozen()
         sequence += 1
+        env.update(VALIDATE_RUN_STAGE=name, VALIDATE_RUN_SEQUENCE=str(sequence))
         log = output / f'{sequence:02d}-{name}.log'
         start = time.monotonic()
         with log.open('w') as stream:
@@ -180,13 +192,15 @@ def main():
                 infrastructure_failed = bool(run('health'))
                 failed = failed or infrastructure_failed
             if not failed:
-                return finish('passed', 0)
+                return finish('passed-after-recovery' if recovered else 'passed', 0)
             run('collect')
             if not infrastructure_failed:
                 return finish('test-failed', 1)
             if recovered or 'recover' not in job:
                 return finish('infrastructure-failed', 2)
             recovered = True
+            evidence['recovered'] = True
+            save()
             if run('recover') or run('verify'):
                 return finish('infrastructure-failed', 2)
             # Recovery always re-enters through health and the smoke flow.

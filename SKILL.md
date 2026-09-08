@@ -162,10 +162,12 @@ Do not spin indefinitely. Implement once the local pattern is clear. If blocked
 or no change is needed, report that conclusion and exit.
 
 TEST PROCEDURE:
-<affected commands, shared resource wrapper, and assigned device/data ownership>
+<lightweight affected commands and the QA owner for heavy checks>
 Run one smoke flow before affected UI flows. Return infrastructure failures and
 artifacts without guessing at product-code fixes. Do not run broad gates that
 belong to combined validation unless the brief specifically requires them.
+Submit heavy checks to the orchestrator's resource-owning command lane. Do not
+change the shared resource directory to work around sandbox restrictions.
 
 REPORT: changes, tests, visual evidence, known gaps.
 ```

@@ -23,6 +23,39 @@ scripts/resource-run --resource heavy --resource simulator-<device-id> -- \
 For a durable job, put this command inside a controller `--runner command` lane.
 Use the controller for its lifecycle and bounded waits. Resource waits are not
 application hangs. Do not wrap controller waits in another background task.
+Use absolute paths to the skill's scripts in actual lane commands. The examples
+above assume the skill directory as the working directory.
+
+Dispatch resource wrappers from the orchestrator in command lanes. Sandboxed
+implementation lanes may not be able to write the shared resource directory.
+They should submit heavy checks to the QA owner, rather than change the lock
+directory or weaken sandbox permissions. Lightweight affected checks may run
+inside their own worktrees. Bootstrap worktrees through the heavy slot too when
+installations contend with validation.
+
+## Interactive testing
+
+For actor testers making multiple browser or simulator tool calls, the
+orchestrator starts a durable command lane that runs:
+
+```bash
+scripts/resource-run --resource heavy --resource simulator-<device-id> \
+  --hold /absolute/path/new-interactive-hold
+```
+
+Omit the simulator resource for browser-only work. Wait for `ready.json` in the
+new hold directory to report `held` and confirm the controller lane is live
+before dispatching the tester. The hold directory must not exist beforehand.
+The holder stays alive until the orchestrator creates `<hold-dir>/release` or
+cancels it. It does not consume CPU beyond a short polling interval.
+
+Keep the hold through the tester's tool calls. Commands inside that ownership
+must not reacquire the same slots. Stop or finish all assigned interactive calls
+before creating the release file. Then wait for the holder to finish. This is a
+supervised resource owner, distinct from a background wrapper waiting on a lane.
+If the holder dies, stop its testers before dispatching replacements. The helper
+cannot revoke an external browser tool call or stop actors it did not launch.
+Do not leave a hold running after its last tester finishes.
 
 `resource-run` accepts `--timeout SECONDS` for slot acquisition. Commands run in
 an owned process group. Cancellation terminates that group. Background children
@@ -41,6 +74,11 @@ coordinated installation. Changing it per run defeats machine-wide exclusion.
 shell. Paths must be absolute or relative to `worktree`. The evidence directory
 must be new and outside the worktree. Store no secrets in the job or command
 output. `environment` should contain explicit public build configuration.
+Ambient variables are restricted to PATH, HOME, TMPDIR, USER, LOGNAME, LANG,
+LC_ALL, SHELL, JAVA_HOME, and DEVELOPER_DIR. Add required ambient names using
+`inherit_environment`. The entire effective environment is fingerprinted before
+run-specific metadata is added. Values are not written into the result. Ambient
+EXPO_PUBLIC variables are absent unless explicitly supplied or inherited.
 
 ```json
 {
@@ -106,6 +144,13 @@ artifact again and reruns the smoke flow before affected tests. A second
 infrastructure failure terminates the job. Product test failures are returned
 without automatic retries or source edits. Run the full regression after the
 affected flows pass and the combined source is fixed.
+
+Adapters receive `VALIDATE_RUN_OUTPUT`, `VALIDATE_RUN_STARTED_AT` (UTC ISO 8601),
+`VALIDATE_RUN_COMMIT`, `VALIDATE_RUN_BUILD_FINGERPRINT`, `VALIDATE_RUN_STAGE`, and
+`VALIDATE_RUN_SEQUENCE`. Use those to select crash reports and write artifacts.
+After recovery, evidence records `recovered: true` and successful tests produce
+`passed-after-recovery`. Review the crash evidence before accepting that result.
+An app-triggered simulator crash remains a product defect even if a retry passes.
 
 Browser sessions also need separate test data. Allocate distinct fixture data
 and ports for independent tests. Coordinate shared state intentionally for a

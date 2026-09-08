@@ -2,6 +2,7 @@
 """Run a foreground command while holding per-user machine-wide resource slots."""
 import argparse
 import fcntl
+import json
 import os
 from pathlib import Path
 import re
@@ -17,11 +18,13 @@ def main():
                         help='heavy, implementation, or simulator-<device-id>')
     parser.add_argument('--timeout', type=float, default=3600,
                         help='maximum seconds to wait for slots')
+    parser.add_argument('--hold', type=Path,
+                        help='hold slots for interactive work; create DIR/release to release')
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
-    if not command or args.timeout < 0:
-        parser.error('a command and nonnegative timeout are required')
+    if bool(command) == bool(args.hold) or args.timeout < 0:
+        parser.error('provide either a command or --hold DIR, and a nonnegative timeout')
     limits = {'heavy': 1, 'implementation': 2}
     names = sorted(set(args.resource))
     for name in names:
@@ -34,6 +37,7 @@ def main():
                                str(Path.home() / '.local/state/agent-fanout/resources')))
     root.mkdir(parents=True, exist_ok=True)
     held = []
+    hold_dir = None
     child = None
     interrupted = None
 
@@ -71,7 +75,8 @@ def main():
 
         if not signal_group(signal.SIGTERM):
             return
-        deadline = time.monotonic() + 2
+        # Leave time for cleanup before the controller's two-second KILL fallback.
+        deadline = time.monotonic() + 1
         while time.monotonic() < deadline:
             child.poll()
             if not signal_group(0):
@@ -109,6 +114,23 @@ def main():
             time.sleep(0.2)
         if interrupted:
             return 128 + interrupted
+        if args.hold:
+            destination = args.hold.resolve()
+            destination.mkdir(parents=True, exist_ok=False)
+            hold_dir = destination
+            ready = {'state': 'held', 'resources': names, 'holder_pid': os.getpid()}
+            temporary = hold_dir / 'ready.json.tmp'
+            temporary.write_text(json.dumps(ready) + '\n')
+            temporary.replace(hold_dir / 'ready.json')
+            print(json.dumps({'held': str(hold_dir), 'resources': names}), flush=True)
+            # A durable command lane owns this hold. Its orchestrator starts
+            # interactive testers only after ready.json, then stops them before
+            # writing release. This is resource ownership, not a lane wait wrapper.
+            while not (hold_dir / 'release').exists():
+                if interrupted:
+                    return 128 + interrupted
+                time.sleep(0.2)
+            return 0
         # Inherit leases into the child so killing this wrapper cannot immediately
         # admit another command while the original command is still alive.
         child = subprocess.Popen(command, start_new_session=True, pass_fds=tuple(held))
@@ -124,6 +146,11 @@ def main():
         return child.returncode if child.returncode >= 0 else 128 - child.returncode
     finally:
         release()
+        if hold_dir is not None and (hold_dir / 'ready.json').exists():
+            state = {'state': 'interrupted' if interrupted else 'released', 'resources': names}
+            temporary = hold_dir / 'ready.json.tmp'
+            temporary.write_text(json.dumps(state) + '\n')
+            temporary.replace(hold_dir / 'ready.json')
 
 
 if __name__ == '__main__':

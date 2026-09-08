@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
@@ -86,6 +87,8 @@ class ValidationTests(unittest.TestCase):
             recover=[PYTHON, '-c', f'from pathlib import Path; Path({str(healthy)!r}).touch()'])
         code, evidence, _ = self.run_job()
         self.assertEqual(code, 0)
+        self.assertTrue(evidence['recovered'])
+        self.assertEqual(evidence['status'], 'passed-after-recovery')
         steps = [x['stage'] for x in evidence['steps']]
         self.assertLess(steps.index('recover'), steps.index('smoke'))
         self.assertLess(steps.index('smoke'), steps.index('test'))
@@ -144,6 +147,34 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(evidence['status'], 'invalid-evidence')
 
+    def test_ambient_build_flags_are_explicit_and_fingerprinted(self):
+        key = 'EXPO_PUBLIC_REVIEW_TEST'
+        with mock.patch.dict(os.environ, {key: 'first'}):
+            self.job['smoke'] = [PYTHON, '-c', f'import os; assert {key!r} not in os.environ']
+            code, _, _ = self.run_job()
+            self.assertEqual(code, 0)
+            self.job.update(smoke=self.success, build=self.success, verify=self.success,
+                            inherit_environment=[key])
+            code, _, receipt = self.run_job()
+            self.assertEqual(code, 0)
+            os.environ[key] = 'second'
+            code, evidence, _ = self.run_job(receipt)
+            self.assertEqual(code, 3)
+            self.assertEqual(evidence['status'], 'invalid-evidence')
+
+    def test_adapters_receive_run_context(self):
+        self.job['smoke'] = [PYTHON, '-c',
+            'import os,json; from pathlib import Path; '
+            'Path(os.environ["VALIDATE_RUN_OUTPUT"],"context.json").write_text('
+            'json.dumps({k:v for k,v in os.environ.items() if k.startswith("VALIDATE_RUN_")}))']
+        code, evidence, receipt = self.run_job()
+        self.assertEqual(code, 0)
+        context = json.loads((receipt.parent / 'context.json').read_text())
+        self.assertEqual(context['VALIDATE_RUN_COMMIT'], evidence['commit'])
+        self.assertEqual(context['VALIDATE_RUN_STARTED_AT'], evidence['started_at'])
+        self.assertEqual(context['VALIDATE_RUN_STAGE'], 'smoke')
+        self.assertEqual(context['VALIDATE_RUN_SEQUENCE'], '1')
+
 
 class ResourceTests(unittest.TestCase):
     def setUp(self):
@@ -196,6 +227,47 @@ class ResourceTests(unittest.TestCase):
         result = subprocess.run(self.command('simulator-device-two', 'pass'),
                                 env=self.env, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0)
+
+    def test_interactive_hold_and_explicit_release(self):
+        directory = self.base / 'interactive'
+        process = subprocess.Popen([PYTHON, str(ROOT / 'resource-run'), '--resource', 'heavy',
+                                    '--hold', str(directory)], env=self.env, stdout=subprocess.DEVNULL)
+        self.addCleanup(lambda: self.stop(process))
+        ready = directory / 'ready.json'
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(ready.exists())
+        self.assertEqual(json.loads(ready.read_text())['state'], 'held')
+        blocked = subprocess.run(self.command('heavy', 'pass', timeout=0.1), env=self.env,
+                                 capture_output=True, timeout=5)
+        self.assertEqual(blocked.returncode, 124)
+        (directory / 'release').touch()
+        self.assertEqual(process.wait(timeout=5), 0)
+        self.assertEqual(json.loads(ready.read_text())['state'], 'released')
+
+    def test_existing_hold_directory_is_not_modified(self):
+        directory = self.base / 'existing'
+        directory.mkdir()
+        ready = directory / 'ready.json'
+        ready.write_text('original owner')
+        result = subprocess.run([PYTHON, str(ROOT / 'resource-run'), '--resource', 'heavy',
+                                 '--hold', str(directory)], env=self.env, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(ready.read_text(), 'original owner')
+
+    def test_multiple_resources_do_not_hold_partial_slots(self):
+        self.holder('simulator-one', self.base / 'ready')
+        waiting = subprocess.Popen([PYTHON, str(ROOT / 'resource-run'), '--resource', 'heavy',
+            '--resource', 'simulator-one', '--timeout', '1', '--', PYTHON, '-c', 'pass'],
+            env=self.env, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: self.stop(waiting))
+        self.assertIn('waiting for', waiting.stderr.readline())
+        other = subprocess.run(self.command('heavy', 'pass', timeout=0.1), env=self.env,
+                               capture_output=True, timeout=5)
+        self.assertEqual(other.returncode, 0)
+        self.assertEqual(waiting.wait(timeout=5), 124)
+        waiting.stderr.close()
 
 
 if __name__ == '__main__':
