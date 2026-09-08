@@ -4,6 +4,7 @@ Use this procedure when local builds, browsers, databases, or simulators contend
 for one machine. Implementation concurrency and validation concurrency are
 separate budgets. Start with two implementation lanes on a constrained host.
 Keep read-only reviews bounded too. Tune from measured load and useful throughput.
+For Maestro and CoreSimulator details, also read [iOS validation](ios-validation.md).
 
 ## Resource ownership
 
@@ -16,7 +17,7 @@ without it. Limit implementation dispatches in the orchestrator. Never wrap a
 short `agent-fanout start` dispatch in a slot and assume the lane remains limited.
 
 ```bash
-scripts/resource-run --resource heavy --resource simulator-<device-id> -- \
+scripts/resource-run --resource heavy -- \
   scripts/validate-run --job /absolute/path/job.json --output /absolute/path/new-evidence-dir
 ```
 
@@ -39,12 +40,12 @@ For actor testers making multiple browser or simulator tool calls, the
 orchestrator starts a durable command lane that runs:
 
 ```bash
-scripts/resource-run --resource heavy --resource simulator-<device-id> \
+scripts/resource-run --resource heavy \
   --hold /absolute/path/new-interactive-hold
 ```
 
-Omit the simulator resource for browser-only work. Wait for `ready.json` in the
-new hold directory to report `held` and confirm the controller lane is live
+Add a device resource when the task uses a shared device. Wait for `ready.json`
+in the new hold directory to report `held` and confirm the controller lane is live
 before dispatching the tester. The hold directory must not exist beforehand.
 The holder stays alive until the orchestrator creates `<hold-dir>/release` or
 cancels it. It does not consume CPU beyond a short polling interval.
@@ -78,28 +79,27 @@ Ambient variables are restricted to PATH, HOME, TMPDIR, USER, LOGNAME, LANG,
 LC_ALL, SHELL, JAVA_HOME, and DEVELOPER_DIR. Add required ambient names using
 `inherit_environment`. The entire effective environment is fingerprinted before
 run-specific metadata is added. Values are not written into the result. Ambient
-EXPO_PUBLIC variables are absent unless explicitly supplied or inherited.
+application configuration variables are absent unless explicitly supplied or inherited.
 
 ```json
 {
   "worktree": "/absolute/path/validation-worktree",
   "commit": "full-commit-sha",
-  "environment": {"EXPO_PUBLIC_IKE_FIXTURES": "1"},
+  "environment": {"PUBLIC_TEST_MODE": "1"},
   "step_timeout": 1800,
-  "build": ["./tools/build-fixture-app"],
-  "verify": ["./tools/verify-installed-fixture-app"],
-  "health": ["./tools/check-owned-simulator"],
-  "smoke": ["maestro", "test", "apps/agent/maestro/smoke.yaml"],
-  "test": ["maestro", "test", "apps/agent/maestro/affected-flow.yaml"],
-  "collect": ["./tools/collect-simulator-failure"],
-  "recover": ["./tools/restart-owned-simulator"]
+  "build": ["./tools/build-test-artifact"],
+  "verify": ["./tools/verify-test-artifact"],
+  "health": ["./tools/check-test-service"],
+  "smoke": ["./tools/test-smoke"],
+  "test": ["./tools/test-affected"],
+  "collect": ["./tools/collect-test-failure"],
+  "recover": ["./tools/restart-owned-test-service"]
 }
 ```
 
 The `tools/*` paths above are application-specific adapters, not bundled tools.
 Use actual commands from the repository. Inspect their behavior before use.
-For browser or package validation, omit simulator adapters. `smoke` and `test`
-are required. `build`, `verify`, `health`, `collect`, and `recover` are optional,
+Omit adapters that do not apply to the job. `smoke` and `test` are required. `build`, `verify`, `health`, `collect`, and `recover` are optional,
 except that building or reusing an artifact requires `verify`.
 
 The helper requires a clean Git worktree. It checks the commit and dirty state
@@ -112,32 +112,25 @@ background descendants when a stage completes. Long-lived services must be owned
 by a separate supervisor, rather than backgrounded inside a stage command.
 
 A failed build stops before verification or tests. `verify` must check that the
-installed artifact matches the expected source and configuration, not merely
-that an app with the same bundle identifier exists. The helper records commit,
+served or installed artifact matches the expected source and configuration.
+An artifact name or a running service alone does not prove its identity. The helper records commit,
 configuration digest, stage outcomes, and logs. It cannot infer installation
 identity without the repository's verification adapter.
 
 Reuse an artifact with `--reuse-build /path/to/previous/result.json` only when its
 receipt matches the source, build command, verification command, and explicit
-configuration. The installation is verified again before tests. Flow-only edits
+effective environment. The artifact is verified again before tests. Test-only edits
 may reuse a build when the application's build inputs are unchanged, but the
 generic helper conservatively invalidates its receipt on any commit change.
 Repository tooling may supply a more precise build-input fingerprint. Do not
-reuse on the basis of a bundle ID or successful prior build alone.
+reuse on the basis of an artifact name or successful prior build alone.
 
-## Simulator failures
+## Infrastructure failures
 
-One QA owner holds the device lease. Other lanes submit affected flows and read
-the resulting screenshots and accessibility trees. Prove one representative
-fixture flow before expanding the suite. Prefer the project's stable fixture
-Release build over development-client prompt dismissal loops.
-
-`health` must check the target simulator and detect new simulator crash reports
-since this run began, including SpringBoard crashes that have already restarted.
-A failed UI assertion alone is not evidence of an infrastructure crash.
-`collect` preserves Maestro artifacts and matching simulator reports before
-recovery. `recover` may restart only the leased simulator. It must not erase
-devices or terminate other runs.
+Use `health` to distinguish an unavailable test service from a product assertion
+failure. Use `collect` to preserve the relevant logs and artifacts before any
+recovery. Restrict `recover` to the service owned by this job. A failed assertion
+alone does not establish an infrastructure failure.
 
 The helper attempts infrastructure recovery at most once. It verifies the
 artifact again and reruns the smoke flow before affected tests. A second
@@ -147,10 +140,10 @@ affected flows pass and the combined source is fixed.
 
 Adapters receive `VALIDATE_RUN_OUTPUT`, `VALIDATE_RUN_STARTED_AT` (UTC ISO 8601),
 `VALIDATE_RUN_COMMIT`, `VALIDATE_RUN_BUILD_FINGERPRINT`, `VALIDATE_RUN_STAGE`, and
-`VALIDATE_RUN_SEQUENCE`. Use those to select crash reports and write artifacts.
+`VALIDATE_RUN_SEQUENCE`. Use those to select time-bounded logs and write artifacts.
 After recovery, evidence records `recovered: true` and successful tests produce
-`passed-after-recovery`. Review the crash evidence before accepting that result.
-An app-triggered simulator crash remains a product defect even if a retry passes.
+`passed-after-recovery`. Review the failure evidence before accepting that result.
+A product-triggered service failure remains a defect even if a retry passes.
 
 Browser sessions also need separate test data. Allocate distinct fixture data
 and ports for independent tests. Coordinate shared state intentionally for a

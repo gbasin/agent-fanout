@@ -73,7 +73,8 @@ OMP uses `--auto-approve`, so scope its brief tightly. It needs one-time auth
    lanes and one heavy validation job. Use the shared resource wrapper for heavy
    jobs and one exclusive owner per simulator. Read
    [validation resources](references/validation.md) before local UI or broad
-   validation. Existing processes are not retroactively throttled.
+   validation. Read [iOS validation](references/ios-validation.md) only for native
+   iOS work. Existing processes are not retroactively throttled.
 9. **Keep validation source fixed.** Reserve a clean checkout at a recorded
    commit for combined validation. Do not apply patches there while it runs.
    Record source, build configuration, artifact verification, and test results.
