@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 import time
@@ -54,6 +55,40 @@ def main():
     }, sort_keys=True).encode()).hexdigest()
     evidence['build_fingerprint'] = fingerprint
     sequence = 0
+    cancel_signal = None
+
+    def interrupt(signum, _frame):
+        nonlocal cancel_signal
+        if cancel_signal is None:
+            cancel_signal = signum
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupt)
+
+    def stop_stage(process):
+        def send(sig):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                try:
+                    process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    raise
+                return False
+            return True
+
+        if send(signal.SIGTERM):
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                process.poll()
+                if not send(0):
+                    break
+                time.sleep(0.02)
+            else:
+                send(signal.SIGKILL)
+        process.wait()
 
     def save():
         (output / 'result.json').write_text(json.dumps(evidence, indent=2) + '\n')
@@ -64,6 +99,8 @@ def main():
 
     def run(name):
         nonlocal sequence
+        if cancel_signal:
+            raise InterruptedError('validation cancelled')
         if name not in job:
             return 0
         frozen()
@@ -71,19 +108,39 @@ def main():
         log = output / f'{sequence:02d}-{name}.log'
         start = time.monotonic()
         with log.open('w') as stream:
+            process = None
             try:
-                code = subprocess.run(job[name], cwd=worktree, env=env,
-                                      stdout=stream, stderr=subprocess.STDOUT,
-                                      timeout=timeout).returncode
-            except subprocess.TimeoutExpired:
-                code = 124
+                process = subprocess.Popen(job[name], cwd=worktree, env=env,
+                                           stdout=stream, stderr=subprocess.STDOUT,
+                                           start_new_session=True)
+                deadline = time.monotonic() + timeout
+                while True:
+                    if cancel_signal:
+                        code = 128 + cancel_signal
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        code = 124
+                        break
+                    try:
+                        code = process.wait(timeout=min(0.1, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
             except OSError as error:
                 stream.write(str(error) + '\n')
                 code = 127
+            finally:
+                if process is not None:
+                    # Stop descendants before health probes or recovery can
+                    # overlap a timed-out or backgrounded test process.
+                    stop_stage(process)
         evidence['steps'].append({'stage': name, 'exit_code': code,
                                   'seconds': round(time.monotonic() - start, 3),
                                   'log': str(log)})
         save()
+        if cancel_signal:
+            raise InterruptedError('validation cancelled')
         frozen()
         return code
 
@@ -133,6 +190,8 @@ def main():
             if run('recover') or run('verify'):
                 return finish('infrastructure-failed', 2)
             # Recovery always re-enters through health and the smoke flow.
+    except InterruptedError:
+        return finish('cancelled', 128 + cancel_signal)
     except (RuntimeError, subprocess.CalledProcessError) as error:
         evidence['error'] = str(error)
         return finish('invalid-evidence', 3)

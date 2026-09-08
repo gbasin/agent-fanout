@@ -68,6 +68,10 @@ The helper requires a clean Git worktree. It checks the commit and dirty state
 before and after each step. Reserve that checkout exclusively for validation.
 These checks detect ordinary drift but cannot prevent a concurrent edit that is
 made and reverted between checks. Generated outputs must follow repo ignore rules.
+Each stage runs in its own process group. On timeout or cancellation, the helper
+stops that group before a health probe or recovery step can begin. It also stops
+background descendants when a stage completes. Long-lived services must be owned
+by a separate supervisor, rather than backgrounded inside a stage command.
 
 A failed build stops before verification or tests. `verify` must check that the
 installed artifact matches the expected source and configuration, not merely

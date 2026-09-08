@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Behavioral tests using tiny subprocesses and disposable Git repositories."""
 import json
+import fcntl
 import os
 from pathlib import Path
 import signal
@@ -88,6 +89,47 @@ class ValidationTests(unittest.TestCase):
         steps = [x['stage'] for x in evidence['steps']]
         self.assertLess(steps.index('recover'), steps.index('smoke'))
         self.assertLess(steps.index('smoke'), steps.index('test'))
+
+    def test_timeout_stops_descendants_before_recovery(self):
+        lock = self.base / 'child-lock'
+        ready = self.base / 'child-ready'
+        child = (f'import fcntl,time; from pathlib import Path; '
+                 f'f=open({str(lock)!r}, "w"); fcntl.flock(f, fcntl.LOCK_EX); '
+                 f'Path({str(ready)!r}).touch(); time.sleep(30)')
+        parent = (f'import subprocess,sys,time; '
+                  f'subprocess.Popen([sys.executable,"-c",{child!r}]); time.sleep(30)')
+        recovery = (f'import fcntl; from pathlib import Path; '
+                    f'assert Path({str(ready)!r}).exists(); '
+                    f'f=open({str(lock)!r}, "r"); fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)')
+        self.job.update(step_timeout=1, test=[PYTHON, '-c', parent],
+                        health=[PYTHON, '-c', f'from pathlib import Path; raise SystemExit(int(Path({str(ready)!r}).exists()))'],
+                        recover=[PYTHON, '-c', recovery])
+        code, evidence, _ = self.run_job()
+        self.assertEqual(code, 2)
+        self.assertEqual(next(x['exit_code'] for x in evidence['steps'] if x['stage'] == 'test'), 124)
+        self.assertEqual(next(x['exit_code'] for x in evidence['steps'] if x['stage'] == 'recover'), 0)
+
+    def test_cancellation_stops_active_stage(self):
+        lock = self.base / 'stage-lock'
+        ready = self.base / 'stage-ready'
+        self.job['test'] = [PYTHON, '-c',
+            f'import fcntl,time; from pathlib import Path; f=open({str(lock)!r}, "w"); '
+            f'fcntl.flock(f, fcntl.LOCK_EX); Path({str(ready)!r}).touch(); time.sleep(30)']
+        spec = self.base / 'cancel-job.json'
+        output = self.base / 'cancel-evidence'
+        spec.write_text(json.dumps(self.job))
+        process = subprocess.Popen([PYTHON, str(ROOT / 'validate-run'), '--job', str(spec),
+                                    '--output', str(output)], stdout=subprocess.DEVNULL)
+        self.addCleanup(lambda: ResourceTests.stop(process))
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(ready.exists())
+        process.send_signal(signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=5), 128 + signal.SIGTERM)
+        self.assertEqual(json.loads((output / 'result.json').read_text())['status'], 'cancelled')
+        with lock.open() as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def test_reuse_verifies_again_and_rejects_config_drift(self):
         self.job.update(build=self.success, verify=self.success)

@@ -62,9 +62,11 @@ def main():
             except PermissionError:
                 # macOS can report EPERM for an empty group after its leader is
                 # reaped. Do not target an inaccessible group after child exit.
-                if child.poll() is not None:
-                    return False
-                raise
+                try:
+                    child.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    raise
+                return False
             return True
 
         if not signal_group(signal.SIGTERM):
