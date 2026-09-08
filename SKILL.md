@@ -6,8 +6,10 @@ description: Delegate implementation work to parallel headless agent-CLI subagen
 # Agent fan-out delegation
 
 The current agent is the orchestrator: decompose, write precise briefs, review
-every diff, merge, and own final verification. Headless runners implement. They
-are cheaper and faster, not smarter—never merge their work unreviewed.
+every diff, merge, and own final verification. Headless runners implement. Review
+their work before merging. The orchestrator owns commits and PRs unless
+the user explicitly chooses another ownership model. Review and validation lanes
+return evidence and do not need their own PRs.
 
 ## Runtime boundary
 
@@ -63,15 +65,30 @@ OMP uses `--auto-approve`, so scope its brief tightly. It needs one-time auth
 6. **No eager interruption.** Analysis can leave a worktree unchanged for
    minutes. The watchdog owns liveness. Cancel only for user stop,
    destructive/out-of-scope writes, or a confirmed failure.
-7. **The orchestrator owns review and final QA.** Runner tests/screenshots are
-   a first-line filter, never sign-off.
+7. **The orchestrator owns review and final QA.** Verify the combined change
+   against its acceptance criteria. Reuse valid evidence from unchanged inputs.
+8. **Budget resources separately from file ownership.** Disjoint files do not
+   make concurrent builds affordable. Bound implementation and review lanes to
+   the host's capacity. On a constrained host, start with two implementation
+   lanes and one heavy validation job. Use the shared resource wrapper for heavy
+   jobs and one exclusive owner per simulator. Read
+   [validation resources](references/validation.md) before local UI or broad
+   validation. Existing processes are not retroactively throttled.
+9. **Keep validation source fixed.** Reserve a clean checkout at a recorded
+   commit for combined validation. Do not apply patches there while it runs.
+   Record source, build configuration, artifact verification, and test results.
+10. **Resolve disagreements with evidence.** A disputed finding needs a code
+    trace, reproduction, or targeted test. Disagreement alone does not dismiss it.
 
 ## 0. Plan phases
 
 - Identify any foundation phase that must land before parallel work.
 - Give every parallel phase disjoint ownership.
-- Choose Codex for judgment-heavy work and OMP for mechanical work.
-- Define exact tests and visual criteria in every brief.
+- Choose Codex for judgment-heavy work and OMP for mechanical work when the user
+  has not specified a runner.
+- Define affected tests and visual criteria in every brief. Use one combined
+  review by default, with specialist reviews for concrete risks. Honor explicit
+  user requirements for separate review lenses or actor-based exploratory tests.
 
 ## 1. Initialize a durable run
 
@@ -117,21 +134,16 @@ so warm what the repository actually needs before launch:
 git -C <integration-worktree> ls-files -o -i --exclude-standard --directory
 ```
 
-Clone copy-on-write inputs such as `node_modules`, `.venv`, `.env*`, generated
-sources, and self-validating expensive compiler caches such as Cargo `target/`.
-Skip outputs/ephemera (`dist`, `.next`, logs, screenshots) and never clone
-`.worktrees/` recursively.
+Follow the repository's bootstrap instructions first. If it requires independent
+installs, run its bootstrap in each worktree. Never copy or symlink `node_modules`
+when the repository forbids it. A package manager's shared store is sufficient.
 
-Use APFS/btrfs copy-on-write where available:
+If the repository permits it, reuse self-validating compiler caches with
+copy-on-write. Do not copy secrets by default. Supply only authorized inputs the
+lane needs. Skip outputs, logs, screenshots, and nested worktrees.
 
-```bash
-cp -cR <source> <lane-destination> 2>/dev/null \
-  || cp -a --reflink=auto <source> <lane-destination> 2>/dev/null \
-  || ln -s <source> <lane-destination>
-```
-
-Do not add `sccache` merely to share Cargo worktree builds: changing
-`RUSTC_WRAPPER` changes fingerprints and can invalidate the cloned target cache.
+Do not introduce a compiler wrapper merely to share caches: changing the wrapper
+can change fingerprints and invalidate the cache.
 
 ## 3. Write briefs
 
@@ -144,19 +156,24 @@ You are working in <absolute lane worktree>. Run pwd first. If it is not this
 worktree, stop and report.
 
 SCOPE—own only: <files/functions>. Do not touch anything else.
-Do not commit. The orchestrator reviews and merges the working-tree diff.
+Do not commit or open a PR. The orchestrator reviews the diff and owns the PR.
 
 Do not spin indefinitely. Implement once the local pattern is clear. If blocked
 or no change is needed, report that conclusion and exit.
 
 TEST PROCEDURE:
-<exact commands>
+<affected commands, shared resource wrapper, and assigned device/data ownership>
+Run one smoke flow before affected UI flows. Return infrastructure failures and
+artifacts without guessing at product-code fixes. Do not run broad gates that
+belong to combined validation unless the brief specifically requires them.
 
 REPORT: changes, tests, visual evidence, known gaps.
 ```
 
-For visual QA, use a globally unique browser name `<run-id>-<phase>` and tell
-the runner exactly what the screenshot must prove.
+For visual QA, use a globally unique browser name `<run-id>-<phase>`, separate
+fixture data, and a unique port. State what the screenshot must prove. A lane
+without the simulator lease submits flows to its QA owner and reads the artifacts.
+It must report that its flows await execution, rather than claim they passed.
 
 ## 4. Start lanes
 
@@ -215,7 +232,10 @@ created → dispatching → running → succeeded | failed | cancelled | interru
 
 After an orchestrator/session restart, call `status` with the recorded run ID.
 Live lanes remain live; completed lanes retain their results; missing
-nonterminal lanes become `interrupted`.
+nonterminal lanes become `interrupted`. Recover that state before launching
+replacements. Checkpoint before compaction and continue an active goal afterward.
+Use foreground bounded waits. Do not add background wait wrappers or poll Git
+file timestamps as a substitute for controller liveness.
 
 To stop an authorized lane:
 
@@ -244,16 +264,21 @@ Apply accepted work to the integration tree:
 git -C <integration-worktree> apply --3way --index <patch>
 ```
 
-Re-run relevant checks after every applied phase. Empty patch is success only
+Run checks invalidated by each applied phase. Empty patch is success only
 when the report explains why no change was needed and the orchestrator agrees.
 
 ## 7. Final QA and landing
 
-On the integration branch, run the repository's full local gate: formatting,
-lint, typecheck/build, unit/integration tests, and the actual e2e command from
-package scripts or CI. Re-check important UI surfaces yourself where relevant.
+On a fixed combined commit, run the repository's required local gates, including
+its actual e2e command. Queue heavy jobs through `scripts/resource-run`. Use
+`scripts/validate-run` for ordered build, verification, smoke, and affected tests
+when repository adapters are available, as described in the validation reference.
+A failed build must stop before tests. Re-check important UI surfaces where
+relevant. Run the full regression at the integration boundary. Repeat validation
+when source, configuration, failures, or unresolved concerns invalidate evidence.
 
-Commit only after the combined tree is green. With a remote, push the unique
+Use a local checkpoint commit to pin validation inputs. Land only after the
+combined tree is green. With a remote, push the unique
 integration branch, open a PR, wait for required checks, then merge according
 to the repository's policy. Without a remote, use the repository's local
 landing policy; concurrent local landings must be serialized and rebased when

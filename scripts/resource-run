@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+"""Run a foreground command while holding per-user machine-wide resource slots."""
+import argparse
+import fcntl
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--resource', action='append', required=True,
+                        help='heavy, implementation, or simulator-<device-id>')
+    parser.add_argument('--timeout', type=float, default=3600,
+                        help='maximum seconds to wait for slots')
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    command = args.command[1:] if args.command[:1] == ['--'] else args.command
+    if not command or args.timeout < 0:
+        parser.error('a command and nonnegative timeout are required')
+    limits = {'heavy': 1, 'implementation': 2}
+    names = sorted(set(args.resource))
+    for name in names:
+        if re.fullmatch(r'simulator-[A-Za-z0-9-]+', name):
+            limits[name] = 1
+        if name not in limits:
+            parser.error(f'unknown resource: {name}')
+    # This deliberately ignores run-specific AGENT_FANOUT_STATE_HOME overrides.
+    root = Path(os.environ.get('AGENT_FANOUT_RESOURCE_HOME',
+                               str(Path.home() / '.local/state/agent-fanout/resources')))
+    root.mkdir(parents=True, exist_ok=True)
+    held = []
+    child = None
+    interrupted = None
+
+    def on_signal(signum, _frame):
+        nonlocal interrupted
+        interrupted = signum
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
+
+    def release():
+        # Never unlink lock files. Other processes may already have them open.
+        for fd in held:
+            os.close(fd)
+        held.clear()
+
+    def stop_group():
+        if child is None:
+            return
+
+        def signal_group(sig):
+            try:
+                os.killpg(child.pid, sig)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                # macOS can report EPERM for an empty group after its leader is
+                # reaped. Do not target an inaccessible group after child exit.
+                if child.poll() is not None:
+                    return False
+                raise
+            return True
+
+        if not signal_group(signal.SIGTERM):
+            return
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            child.poll()
+            if not signal_group(0):
+                return
+            time.sleep(0.05)
+        signal_group(signal.SIGKILL)
+
+    try:
+        deadline = time.monotonic() + args.timeout
+        announced = False
+        while True:
+            for name in names:
+                for slot in range(limits[name]):
+                    fd = os.open(root / f'{name}.{slot}.lock', os.O_CREAT | os.O_RDWR, 0o600)
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        os.close(fd)
+                    else:
+                        held.append(fd)
+                        break
+                else:
+                    break
+            if len(held) == len(names):
+                break
+            release()
+            if interrupted:
+                return 128 + interrupted
+            if time.monotonic() >= deadline:
+                print('resource-run: slot wait timed out', file=sys.stderr)
+                return 124
+            if not announced:
+                print(f'resource-run: waiting for {", ".join(names)}', file=sys.stderr)
+                announced = True
+            time.sleep(0.2)
+        if interrupted:
+            return 128 + interrupted
+        # Inherit leases into the child so killing this wrapper cannot immediately
+        # admit another command while the original command is still alive.
+        child = subprocess.Popen(command, start_new_session=True, pass_fds=tuple(held))
+        while child.poll() is None:
+            if interrupted:
+                stop_group()
+                child.wait()
+                return 128 + interrupted
+            time.sleep(0.1)
+        # A command must keep its servers in the foreground. Reap any background
+        # descendants in its owned process group before releasing the slots.
+        stop_group()
+        return child.returncode if child.returncode >= 0 else 128 - child.returncode
+    finally:
+        release()
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except OSError as error:
+        print(f'resource-run: {error}', file=sys.stderr)
+        sys.exit(2)
