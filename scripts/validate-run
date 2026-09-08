@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Validate a clean Git commit with ordered steps and bounded infrastructure recovery."""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--job', required=True, type=Path)
+    parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--reuse-build', type=Path)
+    args = parser.parse_args()
+    job = json.loads(args.job.read_text())
+    worktree = Path(job['worktree']).resolve()
+    output = args.output.resolve()
+    if output == worktree or worktree in output.parents:
+        parser.error('output must be outside the validation worktree')
+    stages = ('build', 'verify', 'health', 'smoke', 'test', 'collect', 'recover')
+    for name in stages:
+        if name in job and (not isinstance(job[name], list) or not job[name]
+                            or not all(isinstance(x, str) for x in job[name])):
+            parser.error(f'{name} must be a nonempty argv array')
+    if 'smoke' not in job or 'test' not in job:
+        parser.error('smoke and test commands are required')
+    if ('build' in job or args.reuse_build) and 'verify' not in job:
+        parser.error('build/reuse requires an installed-artifact verification command')
+    environment = job.get('environment', {})
+    if not isinstance(environment, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                    for k, v in environment.items()):
+        parser.error('environment must map names to strings')
+    timeout = job.get('step_timeout', 1800)
+    if not isinstance(timeout, (int, float)) or timeout <= 0:
+        parser.error('step_timeout must be positive')
+    inherit = job.get('inherit_environment', [])
+    if not isinstance(inherit, list) or not all(isinstance(k, str) for k in inherit):
+        parser.error('inherit_environment must be a list of variable names')
+    output.mkdir(parents=True, exist_ok=False)
+    base_keys = ('PATH', 'HOME', 'TMPDIR', 'USER', 'LOGNAME', 'LANG', 'LC_ALL',
+                 'SHELL', 'JAVA_HOME', 'DEVELOPER_DIR')
+    env = {key: os.environ[key] for key in (*base_keys, *inherit) if key in os.environ}
+    env.update(environment)
+    started_at = datetime.now(timezone.utc).isoformat()
+    evidence = {'status': 'running', 'steps': [], 'worktree': str(worktree),
+                'started_at': started_at, 'recovered': False}
+
+    def git(*argv):
+        return subprocess.check_output(['git', '-C', str(worktree), *argv], text=True).strip()
+
+    commit = git('rev-parse', 'HEAD')
+    evidence['commit'] = commit
+    evidence['configuration_sha256'] = hashlib.sha256(
+        json.dumps(env, sort_keys=True).encode()).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps({
+        'commit': commit, 'build': job.get('build'), 'verify': job.get('verify'),
+        'environment': env,
+    }, sort_keys=True).encode()).hexdigest()
+    evidence['build_fingerprint'] = fingerprint
+    env.update(VALIDATE_RUN_OUTPUT=str(output), VALIDATE_RUN_STARTED_AT=started_at,
+               VALIDATE_RUN_COMMIT=commit, VALIDATE_RUN_BUILD_FINGERPRINT=fingerprint)
+    sequence = 0
+    cancel_signal = None
+
+    def interrupt(signum, _frame):
+        nonlocal cancel_signal
+        if cancel_signal is None:
+            cancel_signal = signum
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, interrupt)
+
+    def stop_stage(process):
+        def send(sig):
+            try:
+                os.killpg(process.pid, sig)
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                try:
+                    process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    raise
+                return False
+            return True
+
+        if send(signal.SIGTERM):
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                process.poll()
+                if not send(0):
+                    break
+                time.sleep(0.02)
+            else:
+                send(signal.SIGKILL)
+        process.wait()
+
+    def save():
+        (output / 'result.json').write_text(json.dumps(evidence, indent=2) + '\n')
+
+    def frozen():
+        if git('rev-parse', 'HEAD') != commit or git('status', '--porcelain', '--untracked-files=normal'):
+            raise RuntimeError('validation source changed or is dirty; evidence is invalid')
+
+    def run(name):
+        nonlocal sequence
+        if cancel_signal:
+            raise InterruptedError('validation cancelled')
+        if name not in job:
+            return 0
+        frozen()
+        sequence += 1
+        env.update(VALIDATE_RUN_STAGE=name, VALIDATE_RUN_SEQUENCE=str(sequence))
+        log = output / f'{sequence:02d}-{name}.log'
+        start = time.monotonic()
+        with log.open('w') as stream:
+            process = None
+            try:
+                process = subprocess.Popen(job[name], cwd=worktree, env=env,
+                                           stdout=stream, stderr=subprocess.STDOUT,
+                                           start_new_session=True)
+                deadline = time.monotonic() + timeout
+                while True:
+                    if cancel_signal:
+                        code = 128 + cancel_signal
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        code = 124
+                        break
+                    try:
+                        code = process.wait(timeout=min(0.1, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+            except OSError as error:
+                stream.write(str(error) + '\n')
+                code = 127
+            finally:
+                if process is not None:
+                    # Stop descendants before health probes or recovery can
+                    # overlap a timed-out or backgrounded test process.
+                    stop_stage(process)
+        evidence['steps'].append({'stage': name, 'exit_code': code,
+                                  'seconds': round(time.monotonic() - start, 3),
+                                  'log': str(log)})
+        save()
+        if cancel_signal:
+            raise InterruptedError('validation cancelled')
+        frozen()
+        return code
+
+    def finish(status, code):
+        evidence['status'] = status
+        save()
+        print(json.dumps({'status': status, 'evidence': str(output / 'result.json')}))
+        return code
+
+    try:
+        frozen()
+        if job.get('commit', commit) != commit:
+            raise RuntimeError('HEAD does not match the requested commit')
+        if args.reuse_build:
+            receipt = json.loads(args.reuse_build.read_text())
+            if receipt.get('build_fingerprint') != fingerprint or not receipt.get('build_verified'):
+                raise RuntimeError('build receipt does not match this source and configuration')
+        elif run('build'):
+            run('collect')
+            return finish('build-failed', 1)
+        if run('verify'):
+            run('collect')
+            return finish('artifact-verification-failed', 1)
+        if 'verify' in job:
+            evidence['build_verified'] = True
+            save()
+        recovered = False
+        while True:
+            infrastructure_failed = bool(run('health'))
+            failed = infrastructure_failed
+            if not failed:
+                failed = bool(run('smoke'))
+                infrastructure_failed = bool(run('health'))
+                failed = failed or infrastructure_failed
+            if not failed:
+                failed = bool(run('test'))
+                infrastructure_failed = bool(run('health'))
+                failed = failed or infrastructure_failed
+            if not failed:
+                return finish('passed-after-recovery' if recovered else 'passed', 0)
+            run('collect')
+            if not infrastructure_failed:
+                return finish('test-failed', 1)
+            if recovered or 'recover' not in job:
+                return finish('infrastructure-failed', 2)
+            recovered = True
+            evidence['recovered'] = True
+            save()
+            if run('recover') or run('verify'):
+                return finish('infrastructure-failed', 2)
+            # Recovery always re-enters through health and the smoke flow.
+    except InterruptedError:
+        return finish('cancelled', 128 + cancel_signal)
+    except (RuntimeError, subprocess.CalledProcessError) as error:
+        evidence['error'] = str(error)
+        return finish('invalid-evidence', 3)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

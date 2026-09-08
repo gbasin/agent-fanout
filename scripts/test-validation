@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""Behavioral tests using tiny subprocesses and disposable Git repositories."""
+import json
+import fcntl
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent
+PYTHON = sys.executable
+
+
+class ValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.repo = self.base / 'repo'
+        self.repo.mkdir()
+        self.git('init', '-q')
+        self.git('config', 'user.email', 'test@example.invalid')
+        self.git('config', 'user.name', 'Validation Test')
+        (self.repo / 'source').write_text('original\n')
+        self.git('add', '.')
+        self.git('commit', '-qm', 'initial')
+        self.marker = self.base / 'tested'
+        self.success = [PYTHON, '-c', 'pass']
+        self.job = {'worktree': str(self.repo), 'smoke': self.success,
+                    'test': [PYTHON, '-c', f'from pathlib import Path; Path({str(self.marker)!r}).touch()']}
+        self.number = 0
+
+    def git(self, *argv):
+        return subprocess.check_output(['git', '-C', str(self.repo), *argv], text=True)
+
+    def run_job(self, reuse=None):
+        self.number += 1
+        spec = self.base / f'job-{self.number}.json'
+        output = self.base / f'evidence-{self.number}'
+        spec.write_text(json.dumps(self.job))
+        argv = [PYTHON, str(ROOT / 'validate-run'), '--job', str(spec), '--output', str(output)]
+        if reuse:
+            argv += ['--reuse-build', str(reuse)]
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=10)
+        evidence = json.loads((output / 'result.json').read_text())
+        return result.returncode, evidence, output / 'result.json'
+
+    def test_failed_build_never_runs_tests(self):
+        self.job.update(build=[PYTHON, '-c', 'raise SystemExit(7)'], verify=self.success)
+        code, evidence, _ = self.run_job()
+        self.assertEqual(code, 1)
+        self.assertEqual(evidence['status'], 'build-failed')
+        self.assertEqual([x['stage'] for x in evidence['steps']], ['build'])
+        self.assertFalse(self.marker.exists())
+
+    def test_failed_smoke_does_not_run_suite(self):
+        self.job['smoke'] = [PYTHON, '-c', 'raise SystemExit(1)']
+        code, evidence, _ = self.run_job()
+        self.assertEqual(code, 1)
+        self.assertEqual(evidence['status'], 'test-failed')
+        self.assertFalse(self.marker.exists())
+
+    def test_source_mutation_invalidates_success(self):
+        self.job['smoke'] = [PYTHON, '-c', 'from pathlib import Path; Path("source").write_text("changed")']
+        code, evidence, _ = self.run_job()
+        self.assertEqual(code, 3)
+        self.assertEqual(evidence['status'], 'invalid-evidence')
+        self.assertFalse(self.marker.exists())
+
+    def test_infrastructure_recovery_is_bounded(self):
+        self.job.update(health=[PYTHON, '-c', 'raise SystemExit(1)'], recover=self.success)
+        code, evidence, _ = self.run_job()
+        self.assertEqual(code, 2)
+        self.assertEqual(evidence['status'], 'infrastructure-failed')
+        self.assertEqual(sum(x['stage'] == 'recover' for x in evidence['steps']), 1)
+        self.assertFalse(self.marker.exists())
+
+    def test_recovery_returns_through_smoke(self):
+        healthy = self.base / 'healthy'
+        self.job.update(
+            health=[PYTHON, '-c', f'from pathlib import Path; raise SystemExit(0 if Path({str(healthy)!r}).exists() else 1)'],
+            recover=[PYTHON, '-c', f'from pathlib import Path; Path({str(healthy)!r}).touch()'])
+        code, evidence, _ = self.run_job()
+        self.assertEqual(code, 0)
+        self.assertTrue(evidence['recovered'])
+        self.assertEqual(evidence['status'], 'passed-after-recovery')
+        steps = [x['stage'] for x in evidence['steps']]
+        self.assertLess(steps.index('recover'), steps.index('smoke'))
+        self.assertLess(steps.index('smoke'), steps.index('test'))
+
+    def test_timeout_stops_descendants_before_recovery(self):
+        lock = self.base / 'child-lock'
+        ready = self.base / 'child-ready'
+        child = (f'import fcntl,time; from pathlib import Path; '
+                 f'f=open({str(lock)!r}, "w"); fcntl.flock(f, fcntl.LOCK_EX); '
+                 f'Path({str(ready)!r}).touch(); time.sleep(30)')
+        parent = (f'import subprocess,sys,time; '
+                  f'subprocess.Popen([sys.executable,"-c",{child!r}]); time.sleep(30)')
+        recovery = (f'import fcntl; from pathlib import Path; '
+                    f'assert Path({str(ready)!r}).exists(); '
+                    f'f=open({str(lock)!r}, "r"); fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)')
+        self.job.update(step_timeout=1, test=[PYTHON, '-c', parent],
+                        health=[PYTHON, '-c', f'from pathlib import Path; raise SystemExit(int(Path({str(ready)!r}).exists()))'],
+                        recover=[PYTHON, '-c', recovery])
+        code, evidence, _ = self.run_job()
+        self.assertEqual(code, 2)
+        self.assertEqual(next(x['exit_code'] for x in evidence['steps'] if x['stage'] == 'test'), 124)
+        self.assertEqual(next(x['exit_code'] for x in evidence['steps'] if x['stage'] == 'recover'), 0)
+
+    def test_cancellation_stops_active_stage(self):
+        lock = self.base / 'stage-lock'
+        ready = self.base / 'stage-ready'
+        self.job['test'] = [PYTHON, '-c',
+            f'import fcntl,time; from pathlib import Path; f=open({str(lock)!r}, "w"); '
+            f'fcntl.flock(f, fcntl.LOCK_EX); Path({str(ready)!r}).touch(); time.sleep(30)']
+        spec = self.base / 'cancel-job.json'
+        output = self.base / 'cancel-evidence'
+        spec.write_text(json.dumps(self.job))
+        process = subprocess.Popen([PYTHON, str(ROOT / 'validate-run'), '--job', str(spec),
+                                    '--output', str(output)], stdout=subprocess.DEVNULL)
+        self.addCleanup(lambda: ResourceTests.stop(process))
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(ready.exists())
+        process.send_signal(signal.SIGTERM)
+        self.assertEqual(process.wait(timeout=5), 128 + signal.SIGTERM)
+        self.assertEqual(json.loads((output / 'result.json').read_text())['status'], 'cancelled')
+        with lock.open() as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_reuse_verifies_again_and_rejects_config_drift(self):
+        self.job.update(build=self.success, verify=self.success)
+        code, _, receipt = self.run_job()
+        self.assertEqual(code, 0)
+        code, evidence, _ = self.run_job(receipt)
+        self.assertEqual(code, 0)
+        self.assertNotIn('build', [x['stage'] for x in evidence['steps']])
+        self.assertEqual(evidence['steps'][0]['stage'], 'verify')
+        self.job['environment'] = {'PUBLIC_BUILD_MODE': 'different'}
+        code, evidence, _ = self.run_job(receipt)
+        self.assertEqual(code, 3)
+        self.assertEqual(evidence['status'], 'invalid-evidence')
+
+    def test_ambient_build_flags_are_explicit_and_fingerprinted(self):
+        key = 'EXPO_PUBLIC_REVIEW_TEST'
+        with mock.patch.dict(os.environ, {key: 'first'}):
+            self.job['smoke'] = [PYTHON, '-c', f'import os; assert {key!r} not in os.environ']
+            code, _, _ = self.run_job()
+            self.assertEqual(code, 0)
+            self.job.update(smoke=self.success, build=self.success, verify=self.success,
+                            inherit_environment=[key])
+            code, _, receipt = self.run_job()
+            self.assertEqual(code, 0)
+            os.environ[key] = 'second'
+            code, evidence, _ = self.run_job(receipt)
+            self.assertEqual(code, 3)
+            self.assertEqual(evidence['status'], 'invalid-evidence')
+
+    def test_adapters_receive_run_context(self):
+        self.job['smoke'] = [PYTHON, '-c',
+            'import os,json; from pathlib import Path; '
+            'Path(os.environ["VALIDATE_RUN_OUTPUT"],"context.json").write_text('
+            'json.dumps({k:v for k,v in os.environ.items() if k.startswith("VALIDATE_RUN_")}))']
+        code, evidence, receipt = self.run_job()
+        self.assertEqual(code, 0)
+        context = json.loads((receipt.parent / 'context.json').read_text())
+        self.assertEqual(context['VALIDATE_RUN_COMMIT'], evidence['commit'])
+        self.assertEqual(context['VALIDATE_RUN_STARTED_AT'], evidence['started_at'])
+        self.assertEqual(context['VALIDATE_RUN_STAGE'], 'smoke')
+        self.assertEqual(context['VALIDATE_RUN_SEQUENCE'], '1')
+
+
+class ResourceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.env = dict(os.environ, AGENT_FANOUT_RESOURCE_HOME=str(self.base / 'leases'))
+
+    def command(self, resource, code, timeout=2):
+        return [PYTHON, str(ROOT / 'resource-run'), '--resource', resource,
+                '--timeout', str(timeout), '--', PYTHON, '-c', code]
+
+    def holder(self, resource, marker):
+        child = subprocess.Popen(self.command(resource,
+            f'from pathlib import Path; import time; Path({str(marker)!r}).touch(); time.sleep(30)'), env=self.env)
+        self.addCleanup(lambda: self.stop(child))
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(marker.exists())
+        return child
+
+    @staticmethod
+    def stop(child):
+        if child.poll() is None:
+            child.send_signal(signal.SIGTERM)
+            child.wait(timeout=5)
+
+    def test_heavy_exclusion_and_release_after_cancel(self):
+        holder = self.holder('heavy', self.base / 'ready')
+        other_env = dict(self.env, AGENT_FANOUT_STATE_HOME=str(self.base / 'other-run'))
+        blocked = subprocess.run(self.command('heavy', 'pass', timeout=0.1), env=other_env,
+                                 capture_output=True, timeout=5)
+        self.assertEqual(blocked.returncode, 124)
+        self.stop(holder)
+        self.assertEqual(holder.returncode, 128 + signal.SIGTERM)
+        admitted = subprocess.run(self.command('heavy', 'raise SystemExit(7)'), env=other_env,
+                                  capture_output=True, timeout=5)
+        self.assertEqual(admitted.returncode, 7)
+
+    def test_two_implementation_slots(self):
+        self.holder('implementation', self.base / 'one')
+        self.holder('implementation', self.base / 'two')
+        blocked = subprocess.run(self.command('implementation', 'pass', timeout=0.1),
+                                 env=self.env, capture_output=True, timeout=5)
+        self.assertEqual(blocked.returncode, 124)
+
+    def test_distinct_simulators_can_run_independently(self):
+        self.holder('simulator-device-one', self.base / 'ready')
+        result = subprocess.run(self.command('simulator-device-two', 'pass'),
+                                env=self.env, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0)
+
+    def test_interactive_hold_and_explicit_release(self):
+        directory = self.base / 'interactive'
+        process = subprocess.Popen([PYTHON, str(ROOT / 'resource-run'), '--resource', 'heavy',
+                                    '--hold', str(directory)], env=self.env, stdout=subprocess.DEVNULL)
+        self.addCleanup(lambda: self.stop(process))
+        ready = directory / 'ready.json'
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(ready.exists())
+        self.assertEqual(json.loads(ready.read_text())['state'], 'held')
+        blocked = subprocess.run(self.command('heavy', 'pass', timeout=0.1), env=self.env,
+                                 capture_output=True, timeout=5)
+        self.assertEqual(blocked.returncode, 124)
+        (directory / 'release').touch()
+        self.assertEqual(process.wait(timeout=5), 0)
+        self.assertEqual(json.loads(ready.read_text())['state'], 'released')
+
+    def test_existing_hold_directory_is_not_modified(self):
+        directory = self.base / 'existing'
+        directory.mkdir()
+        ready = directory / 'ready.json'
+        ready.write_text('original owner')
+        result = subprocess.run([PYTHON, str(ROOT / 'resource-run'), '--resource', 'heavy',
+                                 '--hold', str(directory)], env=self.env, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(ready.read_text(), 'original owner')
+
+    def test_multiple_resources_do_not_hold_partial_slots(self):
+        self.holder('simulator-one', self.base / 'ready')
+        waiting = subprocess.Popen([PYTHON, str(ROOT / 'resource-run'), '--resource', 'heavy',
+            '--resource', 'simulator-one', '--timeout', '1', '--', PYTHON, '-c', 'pass'],
+            env=self.env, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: self.stop(waiting))
+        self.assertIn('waiting for', waiting.stderr.readline())
+        other = subprocess.run(self.command('heavy', 'pass', timeout=0.1), env=self.env,
+                               capture_output=True, timeout=5)
+        self.assertEqual(other.returncode, 0)
+        self.assertEqual(waiting.wait(timeout=5), 124)
+        waiting.stderr.close()
+
+
+if __name__ == '__main__':
+    unittest.main()

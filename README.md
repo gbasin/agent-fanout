@@ -46,9 +46,13 @@ survives the orchestrator process and records terminal state on disk.
 - Cleanup is run-scoped and refuses live lanes unless explicitly forced.
 
 Separate orchestrators can therefore fan out in the same repository—or use the
-same phase names—without sharing supervisor namespaces. There is intentionally
-no machine-wide concurrency limit; callers remain responsible for CPU, memory,
-API quota, and provider rate limits.
+same phase names—without sharing supervisor namespaces. Heavy commands can share
+per-user machine-wide slots through
+`scripts/resource-run`. `scripts/validate-run` records fixed-source evidence and
+runs build, verification, smoke, and test steps in order. See
+[validation resources](references/validation.md). These opt-in wrappers do not
+throttle existing processes or automatically cap controller lane dispatches.
+Callers still budget implementation lanes, API quota, and provider rate limits.
 
 ## Runners
 
@@ -76,6 +80,7 @@ passes the required network flag by default.
 ```bash
 scripts/test-agent-fanout
 scripts/test-launch-codex-lane
+python3 scripts/test-validation
 ```
 
 The controller suite uses disposable repositories and exercises concurrent
@@ -86,6 +91,7 @@ loss, and cleanup isolation.
 ## Requirements
 
 - Git, tmux, Perl, and standard macOS/Linux command-line tools
+- Python 3 for the optional resource and validation helpers
 - At least one authenticated runner: Codex CLI and/or OMP (`omp /login`, or a
   provider key such as `GEMINI_API_KEY`)
 - Optional for visual QA: [dev-browser](https://github.com/gbasin/dev-browser)
