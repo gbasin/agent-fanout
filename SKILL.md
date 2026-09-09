@@ -152,13 +152,14 @@ The launcher resolves the versioned store, checks pnpm's selection and write
 access inside the Codex sandbox, then grants access to that directory and pins
 `pnpm_config_store_dir` (plus the legacy npm variable) in agent shell commands.
 A failed check stops the lane before agent execution. The option grants shared
-write access; use it only for
-jobs that may trust each other's cached packages. It does not install packages.
+write access; use it only for jobs that may trust each other's cached packages.
+It does not install packages or grant pnpm metadata or Corepack cache access.
 
 Keep each worktree's own dependency installation. If bootstrap or the store
 check fails, report it to the orchestrator. Do not override the store with a
 worktree-local cache, disable sandboxing, or copy a store into a lane. Changing
-dependencies may require another host bootstrap. Lanes started without this
+dependencies may require another host bootstrap. Warm the pinned pnpm version
+on the host too, including after upgrades. Lanes started without this
 option retain their existing permissions and package-manager behavior.
 
 If the repository permits it, reuse self-validating compiler caches with

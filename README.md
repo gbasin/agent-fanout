@@ -76,6 +76,16 @@ with diagnostics in its run log. The store must already exist; this option
 does not install dependencies or migrate existing worktrees. Share it only
 among mutually trusted jobs. Each worktree retains its own `node_modules`.
 
+This grants the package store, not pnpm's metadata cache or Corepack's cache.
+Bootstrap the repository's pinned pnpm version and dependencies on the host.
+If a lane changes dependencies and needs cache writes outside the store,
+return to host bootstrap before continuing.
+
+The preflight uses `codex sandbox` writable roots; the agent receives
+`codex exec --add-dir`. The smoke test checks the sandbox and real installs;
+the launcher tests check the arguments without running a model. Recheck this
+boundary after a Codex upgrade.
+
 The option requires Python 3, pnpm, and Codex's `sandbox` helper. Other lanes
 keep their existing permissions. See [store settings](https://pnpm.io/settings/store)
 and [Codex directory access](https://developers.openai.com/codex/cli/reference).
@@ -102,6 +112,11 @@ For an opt-in macOS smoke test with real Codex sandboxing and pnpm, run
 in two disposable worktrees and checks that unrelated writes stay blocked.
 It runs no model. Set `FANOUT_TEST_PNPM_BIN` to an installed pnpm executable to test
 a specific version without downloading it.
+
+The sandbox smoke test has passed with pnpm 9.10.0, 11.15.1, 11.21.0,
+12.0.0, and 12.2.0. After a pnpm upgrade, warm the store on the host with the new
+version before launching lanes. The preflight resolves the versioned store
+path with `pnpm store path`; it does not hard-code a store version.
 
 The controller suite uses disposable repositories and exercises concurrent
 initialization, linked-worktree discovery, duplicate run rejection, same-named
