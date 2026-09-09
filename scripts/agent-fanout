@@ -298,7 +298,7 @@ cmd_add_lane() {
 }
 
 cmd_start() {
-  local run='' phase='' brief='' runner=codex model='' reasoning='' thinking='' network=1
+  local run='' phase='' brief='' runner=codex model='' reasoning='' thinking='' network=1 pnpm_store=''
   local -a command_args=() launch=()
   while (($#)); do
     case "$1" in
@@ -310,14 +310,16 @@ cmd_start() {
       --reasoning-effort) reasoning=${2:-}; shift 2 ;;
       --thinking) thinking=${2:-}; shift 2 ;;
       --no-network) network=0; shift ;;
+      --pnpm-store) pnpm_store=${2:?--pnpm-store requires DIR}; shift 2 ;;
       --) shift; command_args=("$@"); break ;;
       -h|--help)
-        echo "Usage: agent-fanout start --run ID --phase NAME --brief FILE [--runner codex|omp|command] [runner options] [-- COMMAND...]"; return 0 ;;
+        echo "Usage: agent-fanout start --run ID --phase NAME --brief FILE [--runner codex|omp|command] [--pnpm-store DIR (codex only)] [runner options] [-- COMMAND...]"; return 0 ;;
       *) die "start: unknown argument: $1" ;;
     esac
   done
   [[ -n "$run" && -n "$phase" && -n "$brief" ]] || die "start requires --run, --phase, and --brief"
   [[ -f "$brief" ]] || die "brief not found: $brief"
+  [[ -z "$pnpm_store" || "$runner" == codex ]] || die "--pnpm-store requires --runner codex"
   resolve_run "$run"
   resolve_lane "$phase"
   local status durable_brief result run_log event_log
@@ -341,6 +343,7 @@ cmd_start() {
       [[ -n "$model" ]] && launch+=(--model "$model")
       [[ -n "$reasoning" ]] && launch+=(--reasoning-effort "$reasoning")
       (( network )) || launch+=(--no-network)
+      [[ -z "$pnpm_store" ]] || launch+=(--pnpm-store "$pnpm_store")
       ;;
     omp)
       command -v omp >/dev/null 2>&1 || die "omp executable not found"

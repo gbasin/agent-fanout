@@ -9,7 +9,8 @@ if [ -z "${LAUNCH_CODEX_LANE_SELFCOPY:-}" ]; then
   _self_copy=$(mktemp "${TMPDIR:-/tmp}/launch-codex-lane.self.XXXXXX")
   cp "$0" "$_self_copy"
   chmod +x "$_self_copy"
-  LAUNCH_CODEX_LANE_SELFCOPY="$_self_copy" exec bash "$_self_copy" "$@"
+  LAUNCH_CODEX_LANE_SCRIPTS=$(cd "$(dirname "$0")" && pwd -P) \
+    LAUNCH_CODEX_LANE_SELFCOPY="$_self_copy" exec bash "$_self_copy" "$@"
 fi
 
 usage() {
@@ -35,6 +36,7 @@ Options:
   --model MODEL           Add -m MODEL to codex exec
   --reasoning-effort E    Add -c model_reasoning_effort="E"
   --config KEY=VALUE      Add an extra -c KEY=VALUE; may be repeated
+  --pnpm-store DIR        Use and grant access to this shared pnpm store
   --no-network            Do not add sandbox_workspace_write.network_access=true
   -h, --help              Show this help
 
@@ -61,6 +63,7 @@ codex_bin=codex
 model=
 reasoning_effort=
 network_enabled=1
+pnpm_store=
 extra_configs=()
 
 while (($#)); do
@@ -91,6 +94,8 @@ while (($#)); do
       reasoning_effort=${2:-}; shift 2 ;;
     --config)
       extra_configs+=("${2:-}"); shift 2 ;;
+    --pnpm-store)
+      pnpm_store=${2:?--pnpm-store requires DIR}; shift 2 ;;
     --no-network)
       network_enabled=0; shift ;;
     -h|--help)
@@ -162,6 +167,7 @@ sentinel=$(mktemp "${TMPDIR:-/tmp}/agent-fanout-codex-start.XXXXXX")
 cleanup_sentinel() {
   rm -f "$sentinel"
   rm -f "${LAUNCH_CODEX_LANE_SELFCOPY:-}"
+  rm -f "${cache_probe_output:-}"
 }
 on_exit() {
   local code=$?
@@ -207,7 +213,6 @@ for cfg in "${extra_configs[@]}"; do
   [[ -n "$cfg" ]] || die "--config requires KEY=VALUE"
   codex_args+=(-c "$cfg")
 done
-codex_args+=(-o "$result" "$brief_text")
 
 child_pid=
 child_pgid=
@@ -254,6 +259,39 @@ on_force_cancel() {
   exit 125
 }
 trap on_force_cancel USR1
+
+# The cache probe is also a child process group. Cancellation during preflight
+# must stop pnpm/sandbox children before any agent is started.
+[[ -z "$state_dir" ]] || rm -f "$state_dir/pnpm-store"
+if [[ -n "$pnpm_store" ]]; then
+  command -v python3 >/dev/null 2>&1 || die "--pnpm-store requires Python 3"
+  cache_probe_output=$(mktemp "${TMPDIR:-/tmp}/agent-fanout-store.XXXXXX")
+  perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
+    python3 "$LAUNCH_CODEX_LANE_SCRIPTS/pnpm-store-preflight" \
+    --worktree "$worktree" --store "$pnpm_store" --codex-bin "$codex_bin" \
+    > "$cache_probe_output" 2>> "$run_log" &
+  child_pid=$!
+  child_pgid=$child_pid
+  if ! wait "$child_pid"; then
+    cat "$run_log" >&2
+    die "shared pnpm store preflight failed; bootstrap on the host before relaunching"
+  fi
+  child_pid=
+  child_pgid=
+  pnpm_store=$(<"$cache_probe_output")
+  rm -f "$cache_probe_output"
+  export pnpm_config_store_dir="$pnpm_store" npm_config_store_dir="$pnpm_store"
+  [[ -z "$state_dir" ]] || atomic_write "$state_dir/pnpm-store" "$pnpm_store"
+fi
+
+if [[ -n "$pnpm_store" ]]; then
+  # Explicit shell policy survives restrictive environment inheritance settings.
+  store_value=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' "$pnpm_store")
+  codex_args+=(--add-dir "$pnpm_store"
+    -c "shell_environment_policy.set.pnpm_config_store_dir=$store_value"
+    -c "shell_environment_policy.set.npm_config_store_dir=$store_value")
+fi
+codex_args+=(-o "$result" "$brief_text")
 
 (
   cd "$worktree"

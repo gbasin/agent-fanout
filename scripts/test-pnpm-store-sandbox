@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""Opt-in macOS test: real pnpm installs in two worktrees, no model or network."""
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+ROOT = Path(__file__).resolve().parent
+if sys.platform != 'darwin':
+    sys.exit('This sandbox smoke test currently requires macOS.')
+CODEX = shutil.which('codex')
+PNPM = os.environ.get('FANOUT_TEST_PNPM_BIN') or shutil.which('pnpm')
+if not CODEX or not PNPM:
+    sys.exit('codex and pnpm must be installed.')
+
+
+def run(args, cwd, env=None):
+    p = subprocess.run([str(a) for a in args], cwd=cwd, env=env, text=True,
+                       capture_output=True, timeout=120)
+    if p.returncode:
+        raise RuntimeError(p.stdout + p.stderr)
+    return p.stdout.strip()
+
+
+# Outside the worktrees and default writable temp roots, on the same filesystem.
+cache_parent = Path.home() / '.cache'
+cache_parent.mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='fanout-store-smoke-', dir=cache_parent) as cache, \
+        tempfile.TemporaryDirectory(prefix='fanout-store-worktrees-') as temp:
+    base = Path(temp).resolve()
+    store = Path(cache).resolve() / 'shared store'
+    store.mkdir()
+    unrelated = Path(cache).resolve() / 'unrelated'
+    unrelated.mkdir()
+    repo = base / 'repo'
+    repo.mkdir()
+    tgz = base / 'fixture.tgz'
+    with tarfile.open(tgz, 'w:gz') as tar:
+        for name, content in {
+            'package/package.json': json.dumps({'name': 'fanout-cache-fixture', 'version': '1.0.0', 'main': 'index.js'}),
+            'package/index.js': 'module.exports = 42;\n',
+        }.items():
+            data = content.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    version = run([PNPM, '--version'], repo)
+    (repo / 'package.json').write_text(json.dumps({
+        'name': 'cache-smoke', 'private': True, 'packageManager': 'pnpm@' + version,
+        'dependencies': {'fanout-cache-fixture': 'file:' + str(tgz)},
+    }))
+    (repo / '.gitignore').write_text('node_modules/\n')
+    bin_dir = base / 'bin'
+    bin_dir.mkdir()
+    (bin_dir / 'pnpm').symlink_to(Path(PNPM).resolve())
+    env = dict(os.environ, pnpm_config_store_dir=str(store), npm_config_store_dir=str(store),
+               PATH=str(bin_dir) + os.pathsep + os.environ['PATH'])
+    run([PNPM, 'install', '--offline', '--ignore-scripts'], repo, env)
+    resolved = run([PNPM, 'store', 'path'], repo, env)
+    run(['git', 'init', '-q'], repo)
+    run(['git', 'config', 'user.name', 'Cache Smoke'], repo)
+    run(['git', 'config', 'user.email', 'test@example.invalid'], repo)
+    run(['git', 'add', '.'], repo)
+    run(['git', 'commit', '-qm', 'fixture'], repo)
+    sandbox = [CODEX, 'sandbox']
+    if 'Commands:' in run(sandbox + ['--help'], repo):
+        sandbox.append('macos')
+    config = ['-c', 'sandbox_mode="workspace-write"', '-c',
+              'sandbox_workspace_write.writable_roots=' + json.dumps([resolved])]
+    # Assert isolation, not just a successful write with an accidentally open sandbox.
+    probe = ('import pathlib\np=pathlib.Path(' + repr(str(unrelated / 'probe')) + ')\n'
+             'try: p.write_text("unexpected"); raise RuntimeError("unrelated directory writable")\n'
+             'except PermissionError: print("unrelated write denied")')
+    print(run(sandbox + config + ['--', sys.executable, '-c', probe], repo, env))
+    for name in ['lane-a', 'lane-b']:
+        lane = base / name
+        run(['git', 'worktree', 'add', '-qb', name, lane], repo)
+        selected = run([sys.executable, ROOT / 'pnpm-store-preflight', '--worktree', lane,
+                        '--store', store, '--codex-bin', CODEX], lane, env)
+        assert selected == resolved, (selected, resolved)
+        run(sandbox + config + ['--', PNPM, 'install', '--offline', '--frozen-lockfile', '--ignore-scripts'], lane, env)
+        assert run(['node', '-p', 'require("fanout-cache-fixture")'], lane) == '42'
+        assert (lane / 'node_modules').is_dir() and not (lane / 'node_modules').is_symlink()
+        assert not (lane / '.pnpm-store').exists()
+        assert not (lane / 'node_modules/.pnpm-store').exists()
+        assert not run(['git', 'status', '--porcelain'], lane)
+        print(name + ': sandbox preflight, offline install, dependency load, clean source passed')
+    assert (base / 'lane-a/node_modules').stat().st_ino != (base / 'lane-b/node_modules').stat().st_ino
+    print('PASS: one shared store, independent installations, unrelated writes denied; pnpm ' + version)
