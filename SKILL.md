@@ -137,7 +137,29 @@ git -C <integration-worktree> ls-files -o -i --exclude-standard --directory
 
 Follow the repository's bootstrap instructions first. If it requires independent
 installs, run its bootstrap in each worktree. Never copy or symlink `node_modules`
-when the repository forbids it. A package manager's shared store is sufficient.
+when the repository forbids it.
+
+For pnpm repositories, bootstrap each lane on the host against its frozen
+lockfile before starting the sandboxed agent. Use one explicit shared store
+outside all worktrees, on the same filesystem. Pass that store to Codex lanes:
+
+```bash
+$AF start --run <run-id> --phase <phase> --brief <brief-file> \
+  --runner codex --pnpm-store /absolute/path/to/shared/pnpm/store
+```
+
+The launcher resolves the versioned store, checks pnpm's selection and write
+access inside the Codex sandbox, then grants access to that directory and pins
+`pnpm_config_store_dir` (plus the legacy npm variable) in agent shell commands.
+A failed check stops the lane before agent execution. The option grants shared
+write access; use it only for
+jobs that may trust each other's cached packages. It does not install packages.
+
+Keep each worktree's own dependency installation. If bootstrap or the store
+check fails, report it to the orchestrator. Do not override the store with a
+worktree-local cache, disable sandboxing, or copy a store into a lane. Changing
+dependencies may require another host bootstrap. Lanes started without this
+option retain their existing permissions and package-manager behavior.
 
 If the repository permits it, reuse self-validating compiler caches with
 copy-on-write. Do not copy secrets by default. Supply only authorized inputs the
@@ -305,6 +327,11 @@ find known runs:
 ```bash
 $AF list
 ```
+
+Include retired dependency installations and build outputs in the authorized
+cleanup. Preserve source changes and required evidence first. Shared stores
+live outside worktrees and are not removed by run cleanup. Changing the launch
+configuration does not migrate or delete private stores from existing lanes.
 
 ## Failure reference
 

@@ -67,6 +67,19 @@ starts or quiet wedges from the child JSON stream, result file, and worktree
 progress. Completion notifications are not part of correctness; use `status`,
 bounded `wait`, and `collect` after a restart.
 
+For pnpm lanes, bootstrap on the host with a shared store outside all worktrees,
+then pass `--pnpm-store /absolute/path/to/store` to `start --runner codex`.
+The launcher checks store selection and write access inside the sandbox before
+starting the agent. It grants access only to the resolved store directory and
+pins the store in agent shell commands. A failed check leaves the lane failed
+with diagnostics in its run log. The store must already exist; this option
+does not install dependencies or migrate existing worktrees. Share it only
+among mutually trusted jobs. Each worktree retains its own `node_modules`.
+
+The option requires Python 3, pnpm, and Codex's `sandbox` helper. Other lanes
+keep their existing permissions. See [store settings](https://pnpm.io/settings/store)
+and [Codex directory access](https://developers.openai.com/codex/cli/reference).
+
 ## Visual QA
 
 Headless Codex under the macOS seatbelt cannot launch Chrome, but it can drive a
@@ -80,8 +93,15 @@ passes the required network flag by default.
 ```bash
 scripts/test-agent-fanout
 scripts/test-launch-codex-lane
+python3 scripts/test-pnpm-store
 python3 scripts/test-validation
 ```
+
+For an opt-in macOS smoke test with real Codex sandboxing and pnpm, run
+`python3 scripts/test-pnpm-store-sandbox`. It installs a local fixture offline
+in two disposable worktrees and checks that unrelated writes stay blocked.
+It runs no model. Set `FANOUT_TEST_PNPM_BIN` to an installed pnpm executable to test
+a specific version without downloading it.
 
 The controller suite uses disposable repositories and exercises concurrent
 initialization, linked-worktree discovery, duplicate run rejection, same-named

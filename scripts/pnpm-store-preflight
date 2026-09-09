@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Resolve an explicitly chosen pnpm store and check it in the Codex sandbox."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+def run(command, cwd=None, env=None):
+    result = subprocess.run(command, cwd=cwd, env=env, text=True,
+                            capture_output=True, timeout=60)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip()
+                           or f"command exited {result.returncode}: {command[0]}")
+    return result.stdout.strip()
+
+
+def resolve_store(worktree, store):
+    env = dict(os.environ, pnpm_config_store_dir=str(store), npm_config_store_dir=str(store))
+    value = run(["pnpm", "store", "path"], cwd=worktree, env=env)
+    path = Path(value)
+    if not path.is_absolute():
+        raise RuntimeError(f"pnpm did not return an absolute store path: {value!r}")
+    return path.resolve()
+
+
+def probe(store):
+    if resolve_store(Path.cwd(), store) != store:
+        raise RuntimeError("pnpm selected a different store inside the sandbox")
+    with tempfile.TemporaryFile(dir=store) as file:
+        file.write(b"agent-fanout store access probe\n")
+        file.flush()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--worktree", type=Path)
+    parser.add_argument("--store", required=True, type=Path)
+    parser.add_argument("--codex-bin", default="codex")
+    parser.add_argument("--probe", action="store_true")
+    args = parser.parse_args()
+    if args.probe:
+        probe(args.store)
+        return
+    if args.worktree is None:
+        parser.error("--worktree is required unless --probe is used")
+    if not args.store.is_absolute() or not args.store.is_dir():
+        raise RuntimeError("--pnpm-store must name an existing absolute directory; warm it on the host first")
+    worktree = args.worktree.resolve()
+    chosen = args.store.resolve()
+    store = resolve_store(worktree, chosen)
+    if store != chosen and chosen not in store.parents:
+        raise RuntimeError(f"pnpm ignored the chosen store: {store}")
+    listing = run(["git", "worktree", "list", "--porcelain"], cwd=worktree)
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            checkout = Path(line[len("worktree "):]).resolve()
+            if store == checkout or checkout in store.parents or store in checkout.parents:
+                raise RuntimeError(f"shared store must be separate from worktrees: {store}")
+    if not store.is_dir():
+        raise RuntimeError(f"store is not warmed: {store}; bootstrap on the host first")
+    # Older Codex releases require an OS subcommand; current releases select it.
+    help_text = run([args.codex_bin, "sandbox", "--help"])
+    command = [args.codex_bin, "sandbox"]
+    if "Commands:" in help_text:
+        command.append({"darwin": "macos", "linux": "linux", "win32": "windows"}[sys.platform])
+    command += ["-c", 'sandbox_mode="workspace-write"', "-c",
+                "sandbox_workspace_write.writable_roots=" + json.dumps([str(store)], ensure_ascii=False),
+                "--", sys.executable, str(Path(__file__).resolve()), "--probe", "--store", str(store)]
+    run(command, cwd=worktree, env=dict(os.environ, pnpm_config_store_dir=str(store), npm_config_store_dir=str(store)))
+    print(store)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+        print(f"pnpm-store-preflight: {error}", file=sys.stderr)
+        sys.exit(2)
