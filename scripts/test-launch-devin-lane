@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+LAUNCHER=$ROOT/scripts/launch-devin-lane
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/agent-fanout-devin-test.XXXXXX")
+
+cleanup() {
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+make_repo() {
+  local repo=$1
+  mkdir -p "$repo"
+  git -C "$repo" init -q
+  git -C "$repo" config user.email test@example.invalid
+  git -C "$repo" config user.name "Agent Fanout Test"
+  printf 'base\n' > "$repo/file.txt"
+  git -C "$repo" add file.txt
+  git -C "$repo" commit -q -m init
+}
+
+make_remote_repo() {
+  local repo=$1 remote=$2
+  make_repo "$repo"
+  git -C "$repo" branch -m int-test 2>/dev/null || git -C "$repo" checkout -qb int-test
+  git init -q --bare "$remote"
+  git -C "$repo" remote add origin "$remote"
+  git -C "$repo" push -q origin int-test
+}
+
+make_fake_devin() {
+  local fake=$1
+  cat > "$fake" <<'FAKE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+mode=${FAKE_DEVIN_MODE:?FAKE_DEVIN_MODE is required}
+log_dir=${DEVIN_CLI_LOG_DIR:?DEVIN_CLI_LOG_DIR is required}
+mkdir -p "$log_dir"
+my_log=$log_dir/devin_20990101_$$.log
+
+if [[ -n "${FAKE_DEVIN_PID_FILE:-}" ]]; then
+  printf '%s\n' "$$" > "$FAKE_DEVIN_PID_FILE"
+fi
+
+cloud=0
+export_file=
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    --cloud) cloud=1 ;;
+    --export) i=$((i + 1)); export_file=${args[$i]:-} ;;
+    --respect-workspace-trust|--permission-mode|--model) i=$((i + 1)) ;;
+    --) break ;;
+  esac
+done
+prompt=${args[$((i + 1))]:-}
+
+log_progress() {
+  printf 'fake devin tick %s\n' "$1" >> "$my_log"
+}
+
+write_export() {
+  [[ -n "$export_file" ]] && printf '{"turn":1}\n' > "$export_file"
+}
+
+case "$mode" in
+  dead-start)
+    while :; do sleep 10; done
+    ;;
+  worktree-progress)
+    log_progress start
+    printf 'changed\n' >> file.txt
+    write_export
+    printf 'done\n'
+    ;;
+  log-progress)
+    log_progress one
+    sleep 1
+    log_progress two
+    write_export
+    printf 'done\n'
+    ;;
+  quiet-after-progress)
+    log_progress start
+    printf 'changed\n' >> file.txt
+    while :; do sleep 10; done
+    ;;
+  result-start)
+    printf 'done\n'
+    ;;
+  early-exit)
+    exit 0
+    ;;
+  missing-cloud-args)
+    printf 'prompt=%s\n' "$prompt" >&2
+    ;;
+  cloud-push)
+    [[ "$prompt" == *"TARGET REPOSITORY"* ]] || { echo "prompt missing preamble" >&2; exit 64; }
+    [[ "$prompt" == *"$FAKE_DEVIN_PUSH_BRANCH"* ]] || { echo "prompt missing lane branch" >&2; exit 64; }
+    origin_url=$(git remote get-url origin)
+    tmp_clone=$(mktemp -d "${TMPDIR:-/tmp}/fake-devin-clone.XXXXXX")
+    git clone -q "$origin_url" "$tmp_clone"
+    git -C "$tmp_clone" checkout -qb "$FAKE_DEVIN_PUSH_BRANCH" "origin/$FAKE_DEVIN_BASE_BRANCH"
+    printf 'cloud work\n' > "$tmp_clone/cloud.txt"
+    git -C "$tmp_clone" add cloud.txt
+    git -C "$tmp_clone" -c user.email=t@t -c user.name=t commit -qm cloud
+    log_progress cloned
+    git -C "$tmp_clone" push -q origin "$FAKE_DEVIN_PUSH_BRANCH"
+    log_progress pushed
+    printf 'done cloud\n'
+    ;;
+  confirm-hang)
+    log_progress start
+    printf 'changed\n' >> file.txt
+    while :; do sleep 10; done
+    ;;
+  *)
+    echo "unknown FAKE_DEVIN_MODE: $mode" >&2
+    exit 64
+    ;;
+esac
+FAKE
+  chmod +x "$fake"
+}
+
+assert_contains() {
+  local file=$1 text=$2
+  if ! grep -Fq "$text" "$file"; then
+    echo "expected $file to contain: $text" >&2
+    exit 1
+  fi
+}
+
+wait_for() {  # wait_for <timeout-sec> <cmd...>
+  local deadline=$((SECONDS + $1)); shift
+  until "$@" 2>/dev/null; do
+    (( SECONDS < deadline )) || return 1
+    sleep 0.2
+  done
+}
+
+kill_test_child() {
+  local pid=$1 pgid self_pgid
+  pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')
+  self_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
+  if [[ "$pgid" =~ ^[0-9]+$ && "$pgid" == "$pid" && "$pgid" != "$self_pgid" ]]; then
+    kill -KILL "-$pgid" 2>/dev/null || true
+  else
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+}
+
+run_case() {
+  local name=$1 mode=$2 expected=$3 expected_result_text=${4:-}
+  local case_dir=$TMP/$name repo=$TMP/$name/repo fake=$TMP/$name/fake-devin
+  local result=$TMP/$name/result.md run_log=$TMP/$name/run.log brief=$TMP/$name/brief.md
+  local pid_file=$TMP/$name/fake.pid log_dir=$TMP/$name/devin-logs
+  mkdir -p "$case_dir"
+  make_repo "$repo"
+  make_fake_devin "$fake"
+  printf 'test brief for %s\n' "$name" > "$brief"
+
+  set +e
+  DEVIN_CLI_LOG_DIR="$log_dir" FAKE_DEVIN_MODE="$mode" FAKE_DEVIN_PID_FILE="$pid_file" \
+    "$LAUNCHER" \
+      --worktree "$repo" \
+      --brief "$brief" \
+      --result "$result" \
+      --run-log "$run_log" \
+      --devin-bin "$fake" \
+      --startup-timeout 2 \
+      --quiet-timeout 2 \
+      --poll-interval 1 \
+      > "$case_dir/wrapper.out" 2> "$case_dir/wrapper.err"
+  local status=$?
+  set -e
+
+  if [[ "$status" -ne "$expected" ]]; then
+    echo "case $name: expected exit $expected, got $status" >&2
+    echo "--- stdout ---" >&2; cat "$case_dir/wrapper.out" >&2
+    echo "--- stderr ---" >&2; cat "$case_dir/wrapper.err" >&2
+    echo "--- result ---" >&2; [[ -f "$result" ]] && cat "$result" >&2
+    exit 1
+  fi
+
+  if [[ -n "$expected_result_text" ]]; then
+    assert_contains "$result" "$expected_result_text"
+  fi
+
+  if [[ "$mode" == "dead-start" && -f "$pid_file" ]]; then
+    local fake_pid
+    fake_pid=$(<"$pid_file")
+    if kill -0 "$fake_pid" 2>/dev/null; then
+      echo "case $name: fake devin still alive after watchdog exit: $fake_pid" >&2
+      exit 1
+    fi
+  fi
+
+  printf 'ok %-22s exit=%s\n' "$name" "$status"
+}
+
+run_durable_state_case() {
+  local name=$1 mode=$2 expected_exit=$3 expected_state=$4
+  local case_dir=$TMP/$name
+  local repo=$case_dir/repo fake=$case_dir/fake-devin
+  local result=$case_dir/result.md run_log=$case_dir/run.log brief=$case_dir/brief.md
+  local pid_file=$case_dir/fake.pid state=$case_dir/state out=$case_dir/wrapper.out err=$case_dir/wrapper.err
+  mkdir -p "$case_dir"
+  make_repo "$repo"
+  make_fake_devin "$fake"
+  printf 'test brief for %s\n' "$name" > "$brief"
+
+  DEVIN_CLI_LOG_DIR="$case_dir/devin-logs" FAKE_DEVIN_MODE="$mode" FAKE_DEVIN_PID_FILE="$pid_file" \
+    "$LAUNCHER" \
+      --worktree "$repo" --brief "$brief" --result "$result" --run-log "$run_log" \
+      --state-dir "$state" --devin-bin "$fake" --startup-timeout 60 --quiet-timeout 60 \
+      --poll-interval 1 > "$out" 2> "$err" &
+  local wrapper_pid=$!
+
+  if ! wait_for 20 test -s "$state/child.pid"; then
+    echo "case $name: durable child metadata was not published" >&2
+    kill -KILL "$wrapper_pid" 2>/dev/null || true
+    exit 1
+  fi
+  if ! wait_for 20 grep -q "progress confirmed" "$out"; then
+    echo "case $name: progress was not confirmed before cancellation" >&2
+    kill -KILL "$wrapper_pid" 2>/dev/null || true
+    exit 1
+  fi
+  kill -USR1 "$wrapper_pid"
+
+  set +e
+  wait "$wrapper_pid"
+  local status=$?
+  set -e
+  if [[ "$status" -ne "$expected_exit" ]]; then
+    echo "case $name: expected exit $expected_exit, got $status" >&2
+    cat "$out" "$err" >&2
+    exit 1
+  fi
+  assert_contains "$state/status" "$expected_state"
+  assert_contains "$state/exit-code" "$expected_exit"
+  local child_pid
+  child_pid=$(<"$state/child.pid")
+  if kill -0 "$child_pid" 2>/dev/null; then
+    echo "case $name: durable child still alive after terminal state: $child_pid" >&2
+    kill_test_child "$child_pid"
+    exit 1
+  fi
+  printf 'ok %-22s exit=%s state=%s\n' "$name" "$status" "$expected_state"
+}
+
+run_cloud_case() {
+  local name=cloud-push
+  local case_dir=$TMP/$name repo=$TMP/$name/repo remote=$TMP/$name/origin.git
+  local fake=$TMP/$name/fake-devin
+  local result=$TMP/$name/result.md run_log=$TMP/$name/run.log brief=$TMP/$name/brief.md
+  local log_dir=$TMP/$name/devin-logs
+  mkdir -p "$case_dir"
+  make_remote_repo "$repo" "$remote"
+  make_fake_devin "$fake"
+  printf 'test brief for cloud lane\n' > "$brief"
+
+  set +e
+  DEVIN_CLI_LOG_DIR="$log_dir" FAKE_DEVIN_MODE=cloud-push \
+    FAKE_DEVIN_PUSH_BRANCH=fanout-test-api FAKE_DEVIN_BASE_BRANCH=int-test \
+    "$LAUNCHER" \
+      --worktree "$repo" \
+      --brief "$brief" \
+      --result "$result" \
+      --run-log "$run_log" \
+      --devin-bin "$fake" \
+      --cloud --lane-branch fanout-test-api --base-branch int-test \
+      --startup-timeout 30 --quiet-timeout 30 --poll-interval 1 --remote-poll 1 \
+      > "$case_dir/wrapper.out" 2> "$case_dir/wrapper.err"
+  local status=$?
+  set -e
+
+  if [[ "$status" -ne 0 ]]; then
+    echo "case $name: expected exit 0, got $status" >&2
+    cat "$case_dir/wrapper.out" "$case_dir/wrapper.err" >&2
+    [[ -f "$result" ]] && cat "$result" >&2
+    exit 1
+  fi
+  assert_contains "$case_dir/wrapper.out" "progress confirmed"
+  assert_contains "$result" "done cloud"
+  git -C "$repo" ls-remote origin "refs/heads/fanout-test-api" | grep -q . \
+    || { echo "case $name: lane branch was not pushed to remote" >&2; exit 1; }
+  printf 'ok %-22s exit=%s\n' "$name" "$status"
+}
+
+bash -n "$LAUNCHER"
+
+run_case dead-start dead-start 124 "no child progress before startup timeout"
+run_case worktree-progress worktree-progress 0 "done"
+run_case log-progress log-progress 0 "done"
+run_case result-start result-start 0 "done"
+run_case quiet-after-progress quiet-after-progress 124 "no child progress for 2s"
+run_case early-exit early-exit 1 "devin exited before any child progress signal"
+
+# Argument validation: --cloud requires --lane-branch and --base-branch, checked
+# by the launcher before the child ever runs.
+set +e
+missing_dir=$TMP/missing-args
+mkdir -p "$missing_dir"
+make_repo "$missing_dir/repo"
+make_fake_devin "$missing_dir/fake-devin"
+printf 'brief\n' > "$missing_dir/brief.md"
+"$LAUNCHER" --worktree "$missing_dir/repo" --brief "$missing_dir/brief.md" \
+  --result "$missing_dir/result.md" --run-log "$missing_dir/run.log" \
+  --cloud --devin-bin "$missing_dir/fake-devin" > /dev/null 2>&1
+missing_status=$?
+set -e
+[[ "$missing_status" -eq 2 ]] || { echo "expected validation exit 2, got $missing_status" >&2; exit 1; }
+printf 'ok %-22s exit=%s\n' missing-cloud-args "$missing_status"
+
+run_cloud_case
+run_durable_state_case durable-cancel confirm-hang 125 cancelled
+
+echo "all launch-devin-lane tests passed"

@@ -1,0 +1,564 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Re-exec from a private copy: bash reads scripts incrementally, so editing this
+# file while an instance is mid-run tears the running interpreter. The copy is
+# immune to source edits; it removes itself via the existing EXIT trap chain.
+if [ -z "${LAUNCH_DEVIN_LANE_SELFCOPY:-}" ]; then
+  _self_copy=$(mktemp "${TMPDIR:-/tmp}/launch-devin-lane.self.XXXXXX")
+  cp "$0" "$_self_copy"
+  chmod +x "$_self_copy"
+  LAUNCH_DEVIN_LANE_SELFCOPY="$_self_copy" exec bash "$_self_copy" "$@"
+fi
+
+usage() {
+  cat <<'EOF'
+Usage: launch-devin-lane --worktree DIR --brief FILE --result FILE --run-log FILE [options]
+
+Launch headless Devin CLI (local `devin -p` or cloud `devin --cloud -p`) for one
+agent-fanout lane and fail fast if the child never emits progress or later goes
+quiet for too long.
+
+Required:
+  --worktree DIR          Git worktree to run in (cloud lanes use it only as the
+                          relay's cwd and local review anchor)
+  --brief FILE            Prompt/brief file passed to devin
+  --result FILE           devin stdout result file path
+  --run-log FILE          Child stderr log path
+
+Options:
+  --cloud                 Drive a Devin cloud session instead of the local agent
+  --lane-branch NAME      Remote branch the cloud lane must push (required with
+                          --cloud); head advancement is a progress signal
+  --base-branch NAME      Remote branch the cloud lane branches from (required
+                          with --cloud); must already exist on the remote
+  --remote NAME           Git remote for cloud lanes (default: origin)
+  --remote-poll SEC       Seconds between remote head checks (default: 30)
+  --startup-timeout SEC   Seconds to wait for first child progress
+                          (default: 600 local, 1200 cloud)
+  --quiet-timeout SEC     Seconds of no child progress after startup (default: 900)
+  --transcript FILE       Local lanes: devin --export path
+                          (default: RUN_LOG.transcript.json)
+  --state-dir DIR         Persist machine-readable lane lifecycle and PID files
+  --poll-interval SEC     Poll interval while waiting (default: 5)
+  --devin-bin PATH        Devin executable (default: devin)
+  --model MODEL           Local lanes only: add --model MODEL (cloud ignores it)
+  --permission-mode MODE  Local lanes only (default: autonomous with --sandbox)
+  --no-sandbox            Local lanes only: drop --sandbox; requires
+                          --permission-mode (e.g. bypass) to run unattended
+  -h, --help              Show this help
+
+Progress signals (any resets the watchdog):
+  result file written, run-log growth, worktree status change (local lanes),
+  transcript growth (local lanes), devin CLI log growth for any pid in the
+  child's process group, remote lane-branch head advancement (cloud lanes).
+
+Exit codes:
+  0     devin completed successfully
+  124   progress watchdog killed an alive-but-inactive devin process
+  130   wrapper interrupted by a signal; the child is killed too
+  other devin exit code, or 1 if devin exited cleanly without any progress signal
+EOF
+}
+
+worktree=
+brief=
+result=
+run_log=
+transcript=
+state_dir=
+startup_timeout=
+quiet_timeout=900
+poll_interval=5
+remote_poll=30
+devin_bin=devin
+model=
+permission_mode=
+cloud=0
+lane_branch=
+base_branch=
+remote=origin
+sandbox=1
+
+while (($#)); do
+  case "$1" in
+    --worktree)
+      worktree=${2:-}; shift 2 ;;
+    --brief)
+      brief=${2:-}; shift 2 ;;
+    --result)
+      result=${2:-}; shift 2 ;;
+    --run-log)
+      run_log=${2:-}; shift 2 ;;
+    --transcript)
+      transcript=${2:-}; shift 2 ;;
+    --state-dir)
+      state_dir=${2:-}; shift 2 ;;
+    --startup-timeout)
+      startup_timeout=${2:-}; shift 2 ;;
+    --quiet-timeout)
+      quiet_timeout=${2:-}; shift 2 ;;
+    --poll-interval)
+      poll_interval=${2:-}; shift 2 ;;
+    --remote-poll)
+      remote_poll=${2:-}; shift 2 ;;
+    --devin-bin)
+      devin_bin=${2:-}; shift 2 ;;
+    --model)
+      model=${2:-}; shift 2 ;;
+    --permission-mode)
+      permission_mode=${2:-}; shift 2 ;;
+    --cloud)
+      cloud=1; shift ;;
+    --lane-branch)
+      lane_branch=${2:-}; shift 2 ;;
+    --base-branch)
+      base_branch=${2:-}; shift 2 ;;
+    --remote)
+      remote=${2:-}; shift 2 ;;
+    --no-sandbox)
+      sandbox=0; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      echo "launch-devin-lane: unknown argument: $1" >&2
+      usage >&2
+      exit 2 ;;
+  esac
+done
+
+die() {
+  echo "launch-devin-lane: $*" >&2
+  exit 2
+}
+
+[[ -n "$worktree" ]] || die "--worktree is required"
+[[ -n "$brief" ]] || die "--brief is required"
+[[ -n "$result" ]] || die "--result is required"
+[[ -n "$run_log" ]] || die "--run-log is required"
+if [[ -z "$startup_timeout" ]]; then
+  if (( cloud )); then startup_timeout=1200; else startup_timeout=600; fi
+fi
+[[ "$startup_timeout" =~ ^[0-9]+$ ]] || die "--startup-timeout must be an integer"
+[[ "$quiet_timeout" =~ ^[0-9]+$ ]] || die "--quiet-timeout must be an integer"
+[[ "$poll_interval" =~ ^[0-9]+$ ]] || die "--poll-interval must be an integer"
+[[ "$remote_poll" =~ ^[0-9]+$ ]] || die "--remote-poll must be an integer"
+(( startup_timeout > 0 )) || die "--startup-timeout must be positive"
+(( quiet_timeout > 0 )) || die "--quiet-timeout must be positive"
+(( poll_interval > 0 )) || die "--poll-interval must be positive"
+(( remote_poll > 0 )) || die "--remote-poll must be positive"
+[[ -d "$worktree" ]] || die "worktree does not exist: $worktree"
+worktree=$(cd "$worktree" && pwd -P)
+git -C "$worktree" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || die "not a git worktree: $worktree"
+[[ -f "$brief" ]] || die "brief does not exist: $brief"
+command -v "$devin_bin" >/dev/null 2>&1 || die "devin executable not found: $devin_bin"
+command -v perl >/dev/null 2>&1 || die "perl is required to launch devin in its own process group"
+command -v pgrep >/dev/null 2>&1 || die "pgrep is required to bind devin log files to the lane"
+
+if (( cloud )); then
+  [[ -n "$lane_branch" ]] || die "--cloud requires --lane-branch"
+  [[ -n "$base_branch" ]] || die "--cloud requires --base-branch"
+  git -C "$worktree" remote get-url "$remote" >/dev/null 2>&1 \
+    || die "--cloud requires a reachable git remote: $remote"
+  [[ -z "$model" ]] || echo "launch-devin-lane: warning: --model is ignored by devin --cloud" >&2
+  [[ -z "$transcript" ]] || echo "launch-devin-lane: warning: --transcript is ignored by devin --cloud" >&2
+else
+  [[ -z "$lane_branch" ]] || die "--lane-branch requires --cloud"
+  if (( ! sandbox )) && [[ -z "$permission_mode" ]]; then
+    die "--no-sandbox requires --permission-mode (e.g. bypass) for unattended runs"
+  fi
+fi
+
+if [[ -z "$transcript" ]]; then
+  transcript=$run_log.transcript.json
+fi
+
+mkdir -p "$(dirname "$result")" "$(dirname "$run_log")" "$(dirname "$transcript")"
+rm -f "$result"
+: > "$run_log"
+(( cloud )) || : > "$transcript"
+
+atomic_write() {
+  local file=$1 value=$2 tmp
+  tmp=$file.tmp.$$
+  printf '%s\n' "$value" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+set_lane_status() {
+  [[ -n "$state_dir" ]] || return 0
+  atomic_write "$state_dir/status" "$1"
+}
+
+final_state_override=
+if [[ -n "$state_dir" ]]; then
+  mkdir -p "$state_dir"
+  atomic_write "$state_dir/wrapper.pid" "$$"
+  atomic_write "$state_dir/wrapper.start" "$(ps -o lstart= -p $$ | sed 's/^ *//;s/ *$//')"
+  atomic_write "$state_dir/worktree" "$worktree"
+  atomic_write "$state_dir/result" "$result"
+  atomic_write "$state_dir/run-log" "$run_log"
+  (( cloud )) || atomic_write "$state_dir/event-log" "$transcript"
+  set_lane_status dispatching
+fi
+
+baseline_status=
+(( cloud )) || baseline_status=$(git -C "$worktree" status --porcelain --untracked-files=normal)
+
+DEVIN_LOG_DIR=${DEVIN_CLI_LOG_DIR:-$HOME/.local/share/devin/cli/logs}
+sentinel=$(mktemp "${TMPDIR:-/tmp}/agent-fanout-devin-start.XXXXXX")
+cleanup_sentinel() {
+  rm -f "$sentinel"
+  rm -f "${LAUNCH_DEVIN_LANE_SELFCOPY:-}"
+}
+on_exit() {
+  local code=$?
+  cleanup_sentinel
+  if [[ -n "$state_dir" ]]; then
+    atomic_write "$state_dir/exit-code" "$code"
+    case "$final_state_override" in
+      cancelled|interrupted|failed)
+        set_lane_status "$final_state_override"
+        ;;
+      *)
+        if (( code == 0 )); then
+          set_lane_status succeeded
+        else
+          set_lane_status failed
+        fi
+        ;;
+    esac
+  fi
+}
+trap on_exit EXIT
+touch "$sentinel"
+# BSD find's -newer can effectively compare at coarse timestamp resolution in
+# fast tests and launches. Backdate the sentinel slightly so a log created
+# immediately after launch is still considered newer.
+perl -e 'utime(time() - 2, time() - 2, @ARGV)' "$sentinel" 2>/dev/null || true
+
+prompt=$(<"$brief")
+if (( cloud )); then
+  : # cloud preamble is prepended below
+else
+  prompt=$(cat <<EOF
+You are a headless agent-fanout lane running under Devin CLI in autonomous
+sandbox mode.
+
+CONSTRAINTS
+  The edit/write file tools are rejected in this mode. Make ALL file changes
+  with the exec tool: shell heredocs, python scripts, sed, git apply, etc.
+  Shell commands run inside an OS sandbox confined to this worktree; network
+  may be filtered and writes outside the worktree are denied.
+
+BRIEF
+$prompt
+EOF
+)
+fi
+if (( cloud )); then
+  origin_url=$(git -C "$worktree" remote get-url "$remote")
+  clone_url=$origin_url
+  case "$origin_url" in
+    git@github.com:*)
+      clone_url="https://github.com/${origin_url#git@github.com:}" ;;
+    ssh://git@github.com/*)
+      clone_url="https://github.com/${origin_url#ssh://git@github.com/}" ;;
+  esac
+  prompt=$(cat <<EOF
+You are a Devin cloud lane in an agent-fanout run. Your VM may already contain a
+clone of another repository under ~/repos; ignore it unless it is the target
+below. Work only on the target repository.
+
+TARGET REPOSITORY
+  Clone: $clone_url
+  Base:  fetch $base_branch and check out $remote/$base_branch
+  Branch: create $lane_branch from that base, commit your work there
+
+RULES
+  Do not open a pull request. Do not use git commit --no-verify; it is blocked.
+  The remote credential may be read-only for some repositories: if
+  git push -u origin $lane_branch fails with 403 or authentication errors,
+  report the exact error and stop; do not retry with other credentials.
+  When the work is complete, push with: git push -u origin $lane_branch
+
+BRIEF
+$prompt
+
+REPORT
+  Summarize changes, tests run, evidence, and known gaps. End with the pushed
+  branch name and its HEAD sha. If you could not push, say so explicitly.
+EOF
+)
+fi
+
+devin_args=()
+if (( cloud )); then
+  devin_args+=(--cloud -p --respect-workspace-trust false)
+else
+  devin_args+=(-p --respect-workspace-trust false --export "$transcript")
+  if (( sandbox )); then
+    devin_args+=(--sandbox --permission-mode "${permission_mode:-autonomous}")
+  else
+    devin_args+=(--permission-mode "$permission_mode")
+  fi
+  [[ -n "$model" ]] && devin_args+=(--model "$model")
+fi
+devin_args+=(-- "$prompt")
+
+child_pid=
+child_pgid=
+progress_confirmed=0
+
+kill_child_group() {
+  if [[ -n "${child_pid:-}" ]] && kill -0 "$child_pid" 2>/dev/null; then
+    # The perl shim set its process group id to its pid before execing devin.
+    kill -TERM "-${child_pgid:-$child_pid}" 2>/dev/null || true
+    sleep 2
+    kill -KILL "-${child_pgid:-$child_pid}" 2>/dev/null || true
+  fi
+}
+
+on_signal() {
+  final_state_override=interrupted
+  set_lane_status interrupting
+  kill_child_group
+  exit 130
+}
+trap on_signal INT TERM HUP
+
+on_force_cancel() {
+  final_state_override=cancelled
+  set_lane_status cancelling
+  kill_child_group
+  exit 125
+}
+trap on_force_cancel USR1
+
+(
+  cd "$worktree"
+  exec perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \
+    "$devin_bin" "${devin_args[@]}"
+) >"$result" 2>"$run_log" </dev/null &
+child_pid=$!
+child_pgid=$child_pid
+if [[ -n "$state_dir" ]]; then
+  atomic_write "$state_dir/child.pid" "$child_pid"
+  atomic_write "$state_dir/child.pgid" "$child_pgid"
+  atomic_write "$state_dir/child.start" "$(ps -o lstart= -p "$child_pid" | sed 's/^ *//;s/ *$//')"
+  set_lane_status running
+fi
+
+echo "agent-fanout: launched devin pid=$child_pid worktree=$worktree cloud=$cloud"
+echo "agent-fanout: startup timeout=${startup_timeout}s quiet timeout=${quiet_timeout}s run_log=$run_log result=$result"
+
+file_size() {
+  if [[ -e "$1" ]]; then
+    wc -c < "$1" | tr -d '[:space:]'
+  else
+    printf 0
+  fi
+}
+
+# Devin CLI writes a per-process log named devin_<timestamp>_<pid>.log. Any pid
+# in the child's process group may write one (the -p child can spawn an ACP
+# subprocess), so sum the sizes of log files bound to the group.
+devin_log_size() {
+  local total=0 pid file size
+  while IFS= read -r pid; do
+    for file in "$DEVIN_LOG_DIR"/devin_*_"$pid".log; do
+      [[ -e "$file" ]] || continue
+      size=$(file_size "$file")
+      total=$((total + size))
+    done
+  done < <(pgrep -g "$child_pgid" 2>/dev/null || true)
+  printf '%s' "$total"
+}
+
+remote_head() {
+  # The alarm bounds connect/transfer stalls so a wedged network cannot freeze
+  # the watchdog loop itself. GIT_TERMINAL_PROMPT prevents credential prompts.
+  GIT_TERMINAL_PROMPT=0 perl -e 'alarm 20; exec @ARGV' \
+    git -C "$worktree" ls-remote "$remote" "refs/heads/$lane_branch" 2>/dev/null \
+    | awk 'NR==1{print $1}'
+}
+
+last_devin_log_size=0
+last_run_log_size=0
+last_remote_head=
+last_remote_check=0
+
+detect_progress_signal() {
+  if [[ -s "$result" ]]; then
+    printf 'result file created'
+    return 0
+  fi
+
+  if (( ! cloud )); then
+    local current_status
+    current_status=$(git -C "$worktree" status --porcelain --untracked-files=normal)
+    if [[ "$current_status" != "$baseline_status" ]]; then
+      printf 'worktree status changed'
+      return 0
+    fi
+  fi
+
+  local run_log_size
+  run_log_size=$(file_size "$run_log")
+  if (( run_log_size > last_run_log_size )); then
+    printf 'run-log growth (%s bytes)' "$run_log_size"
+    return 0
+  fi
+
+  local logs
+  logs=$(devin_log_size)
+  if [[ "$logs" =~ ^[0-9]+$ ]] && (( logs > last_devin_log_size )); then
+    printf 'devin cli log growth (%s bytes)' "$logs"
+    return 0
+  fi
+
+  return 1
+}
+
+write_diagnostic_result() {
+  local reason=$1
+  {
+    echo "Devin lane progress watchdog failed."
+    echo
+    echo "Reason: $reason"
+    echo "Worktree: $worktree"
+    echo "Cloud: $cloud"
+    if (( cloud )); then
+      echo "Lane branch: $lane_branch (remote: $remote)"
+      echo "Last remote head: ${last_remote_head:-none}"
+    fi
+    echo "Brief: $brief"
+    echo "Run log: $run_log"
+    if (( ! cloud )); then echo "Transcript: $transcript"; fi
+    echo "Startup timeout: ${startup_timeout}s"
+    echo "Quiet timeout: ${quiet_timeout}s"
+    echo "Child pid: ${child_pid:-unknown}"
+    echo "Progress confirmed: $progress_confirmed"
+    echo
+    echo "Devin CLI logs for child process group ${child_pgid:-unknown}:"
+    local any=0 pid file
+    while IFS= read -r pid; do
+      for file in "$DEVIN_LOG_DIR"/devin_*_"$pid".log; do
+        [[ -e "$file" ]] || continue
+        any=1
+        echo "- $file ($(file_size "$file") bytes)"
+      done
+    done < <(pgrep -g "${child_pgid:-0}" 2>/dev/null || true)
+    (( any )) || echo "- none found after launch"
+    echo
+    if (( ! cloud )); then
+      echo "Git status delta:"
+      local current_status
+      current_status=$(git -C "$worktree" status --porcelain --untracked-files=normal)
+      if [[ "$current_status" == "$baseline_status" ]]; then
+        echo "(unchanged from launch)"
+      else
+        printf '%s\n' "$current_status"
+      fi
+      echo
+    fi
+    echo "Run log tail:"
+    tail -80 "$run_log" 2>/dev/null || true
+  } > "$result"
+}
+
+startup_deadline=$((SECONDS + startup_timeout))
+last_progress_at=$SECONDS
+last_progress_signal=
+last_result_size=0
+last_run_log_size=0
+last_transcript_size=0
+last_status=$baseline_status
+
+record_progress() {
+  last_progress_signal=$1
+  last_progress_at=$SECONDS
+  if (( ! progress_confirmed )); then
+    progress_confirmed=1
+    echo "agent-fanout: progress confirmed: $last_progress_signal"
+    echo "agent-fanout: keep waiting for process exit; quiet spans are normal during analysis"
+    echo "agent-fanout: interrupt only for user stop or out-of-scope/destructive behavior; quiet wedges are supervised by the wrapper"
+  fi
+}
+
+poll_progress() {
+  local signal current_result_size current_run_log_size current_transcript_size current_status current_logs
+  if signal=$(detect_progress_signal); then
+    current_result_size=$(file_size "$result")
+    current_run_log_size=$(file_size "$run_log")
+    current_transcript_size=$(file_size "$transcript")
+    current_logs=$(devin_log_size)
+    current_status=$baseline_status
+    (( cloud )) || current_status=$(git -C "$worktree" status --porcelain --untracked-files=normal)
+    if [[ "$signal" != "$last_progress_signal" || "$current_result_size" != "$last_result_size" || "$current_run_log_size" != "$last_run_log_size" || "$current_transcript_size" != "$last_transcript_size" || "$current_logs" != "$last_devin_log_size" || "$current_status" != "$last_status" ]]; then
+      last_result_size=$current_result_size
+      last_run_log_size=$current_run_log_size
+      last_transcript_size=$current_transcript_size
+      last_devin_log_size=$current_logs
+      last_status=$current_status
+      record_progress "$signal"
+    elif (( ! progress_confirmed )); then
+      record_progress "$signal"
+    fi
+  fi
+
+  # Remote head polling mutates state, so it must run here in the caller's
+  # shell, not inside detect_progress_signal's command substitution.
+  if (( cloud )) && (( SECONDS - last_remote_check >= remote_poll )); then
+    last_remote_check=$SECONDS
+    local head
+    head=$(remote_head)
+    if [[ -n "$head" && "$head" != "$last_remote_head" ]]; then
+      last_remote_head=$head
+      record_progress "remote branch head advanced ($head)"
+    fi
+  fi
+}
+
+while kill -0 "$child_pid" 2>/dev/null; do
+  poll_progress
+
+  if (( ! progress_confirmed && SECONDS >= startup_deadline )); then
+    echo "agent-fanout: startup progress watchdog timed out; killing devin process group" >&2
+    write_diagnostic_result "no child progress before startup timeout: no result file, no run-log/devin-log growth, and no worktree or remote-branch progress"
+    kill_child_group
+    wait "$child_pid" 2>/dev/null || true
+    final_state_override=failed
+    exit 124
+  fi
+
+  if (( progress_confirmed && SECONDS - last_progress_at >= quiet_timeout )); then
+    echo "agent-fanout: quiet progress watchdog timed out; killing devin process group" >&2
+    write_diagnostic_result "no child progress for ${quiet_timeout}s after: ${last_progress_signal:-unknown}"
+    kill_child_group
+    wait "$child_pid" 2>/dev/null || true
+    final_state_override=failed
+    exit 124
+  fi
+
+  sleep "$poll_interval"
+done
+
+set +e
+wait "$child_pid"
+child_status=$?
+set -e
+
+poll_progress
+if (( ! progress_confirmed )); then
+  if signal=$(detect_progress_signal); then
+    record_progress "$signal at process exit"
+  else
+    write_diagnostic_result "devin exited before any child progress signal (exit $child_status)"
+    if (( child_status == 0 )); then
+      exit 1
+    fi
+  fi
+fi
+exit "$child_status"
