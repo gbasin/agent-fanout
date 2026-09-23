@@ -335,7 +335,8 @@ cmd_start() {
   cp "$brief" "$durable_brief"
   rm -f "$LANE_DIR/cancel.request" "$LANE_DIR/exit-code" \
     "$LANE_DIR/wrapper.pid" "$LANE_DIR/wrapper.start" \
-    "$LANE_DIR/child.pid" "$LANE_DIR/child.pgid" "$LANE_DIR/child.start"
+    "$LANE_DIR/child.pid" "$LANE_DIR/child.pgid" "$LANE_DIR/child.start" \
+    "$LANE_DIR/remote-branch" "$LANE_DIR/remote-base"
 
   case "$runner" in
     codex)
@@ -572,6 +573,13 @@ cmd_cancel() {
       kill -TERM "-$pgid" 2>/dev/null || true; sleep 2; kill -KILL "-$pgid" 2>/dev/null || true
     fi
     if pid_matches_start "$wrapper" "$LANE_DIR/wrapper.start"; then kill -TERM "$wrapper" 2>/dev/null || true; fi
+    tmux -L "$SOCKET" kill-session -t "=$phase" 2>/dev/null || true
+    # A dying wrapper's EXIT/HUP trap writes failed/interrupted; wait for it to
+    # finish so it cannot clobber the cancelled status below.
+    deadline=$((SECONDS + 3))
+    while (( SECONDS < deadline )) && pid_matches_start "$wrapper" "$LANE_DIR/wrapper.start"; do
+      sleep 0.2
+    done
     atomic_write "$LANE_DIR/exit-code" 125
     atomic_write "$LANE_DIR/status" cancelled
   fi

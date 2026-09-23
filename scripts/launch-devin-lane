@@ -336,6 +336,14 @@ on_force_cancel() {
 }
 trap on_force_cancel USR1
 
+# A cancel may land between 'dispatching' and wrapper.pid publication, before
+# any signal target exists. Honor the durable request instead of starting work
+# that would resurrect the lane to running after it was recorded cancelled.
+if [[ -n "$state_dir" && -f "$state_dir/cancel.request" ]]; then
+  final_state_override=cancelled
+  exit 125
+fi
+
 (
   cd "$worktree"
   exec perl -e 'setpgrp(0, 0) or die "setpgrp: $!"; exec @ARGV or die "exec: $!"' \

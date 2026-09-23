@@ -350,4 +350,26 @@ run_signal_case signal-post-start confirmed-hang 1 1
 run_durable_state_case durable-success json-start wait 0 succeeded
 run_durable_state_case durable-cancel confirmed-hang cancel 125 cancelled
 
+# A cancel that lands before wrapper.pid is published must be honored via the
+# durable cancel.request file — the child must never start.
+pre_dir=$TMP/pre-launch-cancel
+mkdir -p "$pre_dir"
+make_repo "$pre_dir/repo"
+make_fake_codex "$pre_dir/fake-codex"
+printf 'brief\n' > "$pre_dir/brief.md"
+mkdir -p "$pre_dir/state"
+printf 'cancelled before launch\n' > "$pre_dir/state/cancel.request"
+set +e
+CODEX_HOME="$pre_dir/codex-home" "$LAUNCHER" \
+  --worktree "$pre_dir/repo" --brief "$pre_dir/brief.md" \
+  --result "$pre_dir/result.md" --run-log "$pre_dir/run.log" \
+  --state-dir "$pre_dir/state" --codex-bin "$pre_dir/fake-codex" \
+  > "$pre_dir/wrapper.out" 2> "$pre_dir/wrapper.err"
+pre_status=$?
+set -e
+[[ "$pre_status" -eq 125 ]] || { echo "expected exit 125, got $pre_status" >&2; exit 1; }
+assert_contains "$pre_dir/state/status" cancelled
+[[ ! -f "$pre_dir/state/child.pid" ]] || { echo "child started despite cancel.request" >&2; exit 1; }
+printf 'ok %-18s exit=%s state=%s\n' pre-launch-cancel "$pre_status" cancelled
+
 echo "all launch-codex-lane tests passed"

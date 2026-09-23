@@ -320,4 +320,25 @@ printf 'ok %-22s exit=%s\n' missing-cloud-args "$missing_status"
 run_cloud_case
 run_durable_state_case durable-cancel confirm-hang 125 cancelled
 
+# A cancel that lands before wrapper.pid is published must be honored via the
+# durable cancel.request file — the child must never start.
+pre_dir=$TMP/pre-launch-cancel
+mkdir -p "$pre_dir"
+make_repo "$pre_dir/repo"
+make_fake_devin "$pre_dir/fake-devin"
+printf 'brief\n' > "$pre_dir/brief.md"
+mkdir -p "$pre_dir/state"
+printf 'cancelled before launch\n' > "$pre_dir/state/cancel.request"
+set +e
+"$LAUNCHER" --worktree "$pre_dir/repo" --brief "$pre_dir/brief.md" \
+  --result "$pre_dir/result.md" --run-log "$pre_dir/run.log" \
+  --state-dir "$pre_dir/state" --devin-bin "$pre_dir/fake-devin" \
+  > "$pre_dir/wrapper.out" 2> "$pre_dir/wrapper.err"
+pre_status=$?
+set -e
+[[ "$pre_status" -eq 125 ]] || { echo "expected exit 125, got $pre_status" >&2; exit 1; }
+assert_contains "$pre_dir/state/status" cancelled
+[[ ! -f "$pre_dir/state/child.pid" ]] || { echo "child started despite cancel.request" >&2; exit 1; }
+printf 'ok %-22s exit=%s state=%s\n' pre-launch-cancel "$pre_status" cancelled
+
 echo "all launch-devin-lane tests passed"
