@@ -4,6 +4,7 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 CODEX_LAUNCHER=$ROOT/scripts/launch-codex-lane
 COMMAND_LAUNCHER=$ROOT/scripts/launch-command-lane
+DEVIN_LAUNCHER=$ROOT/scripts/launch-devin-lane
 STATE_HOME=${AGENT_FANOUT_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-fanout}
 LOCK_DIR=
 
@@ -42,7 +43,7 @@ atomic_write() {
 }
 
 read_file() {
-  [[ -f "$1" ]] && cat "$1"
+  [[ ! -f "$1" ]] || cat "$1"
 }
 
 json_quote() {
@@ -313,7 +314,7 @@ cmd_start() {
       --pnpm-store) pnpm_store=${2:?--pnpm-store requires DIR}; shift 2 ;;
       --) shift; command_args=("$@"); break ;;
       -h|--help)
-        echo "Usage: agent-fanout start --run ID --phase NAME --brief FILE [--runner codex|omp|command] [--pnpm-store DIR (codex only)] [runner options] [-- COMMAND...]"; return 0 ;;
+        echo "Usage: agent-fanout start --run ID --phase NAME --brief FILE [--runner codex|omp|command|devin|devin-cloud] [--pnpm-store DIR (codex only)] [runner options] [-- COMMAND...]"; return 0 ;;
       *) die "start: unknown argument: $1" ;;
     esac
   done
@@ -358,6 +359,33 @@ cmd_start() {
       ((${#command_args[@]})) || die "command runner requires COMMAND after --"
       launch=("$COMMAND_LAUNCHER" --worktree "$LANE_WORKTREE" --state-dir "$LANE_DIR" \
         --result "$result" --run-log "$run_log" -- "${command_args[@]}")
+      ;;
+    devin)
+      (( network )) || die "--no-network is only supported for --runner codex"
+      launch=("$DEVIN_LAUNCHER" --worktree "$LANE_WORKTREE" --brief "$durable_brief" \
+        --result "$result" --run-log "$run_log" --state-dir "$LANE_DIR")
+      [[ -n "$model" ]] && launch+=(--model "$model")
+      ;;
+    devin-cloud)
+      (( network )) || die "--no-network is only supported for --runner codex"
+      command -v devin >/dev/null 2>&1 || die "devin executable not found"
+      git -C "$MAIN" remote get-url origin >/dev/null 2>&1 \
+        || die "devin-cloud requires an origin remote the cloud VM can reach"
+      local lane_branch=fanout-$SID-$phase
+      # The cloud session branches from the integration branch on the remote, so
+      # the integration tip must be pushed before the lane starts.
+      acquire_repo_lock "$REPO_ID"
+      if ! git -C "$MAIN" push origin "int-$SID:refs/heads/int-$SID"; then
+        release_repo_lock
+        die "could not push int-$SID to origin; devin-cloud lanes need the base on the remote"
+      fi
+      release_repo_lock
+      atomic_write "$RUN_DIR/pushed-int" "int-$SID"
+      atomic_write "$LANE_DIR/remote-branch" "$lane_branch"
+      atomic_write "$LANE_DIR/remote-base" "int-$SID"
+      launch=("$DEVIN_LAUNCHER" --worktree "$LANE_WORKTREE" --brief "$durable_brief" \
+        --result "$result" --run-log "$run_log" --state-dir "$LANE_DIR" \
+        --cloud --lane-branch "$lane_branch" --base-branch "int-$SID" --remote origin)
       ;;
     *) die "unsupported runner: $runner" ;;
   esac
@@ -494,6 +522,21 @@ cmd_collect() {
   status=$(read_file "$LANE_DIR/status"); result=$(read_file "$LANE_DIR/result")
   printf 'status=%s\nworktree=%s\nresult=%s\nrun_log=%s\nevent_log=%s\n' \
     "$status" "$LANE_WORKTREE" "$result" "$(read_file "$LANE_DIR/run-log")" "$(read_file "$LANE_DIR/event-log")"
+  local remote_branch
+  remote_branch=$(read_file "$LANE_DIR/remote-branch")
+  if [[ -n "$remote_branch" ]]; then
+    # Cloud lanes commit in the Devin VM, not the local worktree. Fetch the
+    # pushed branch into a run-namespaced remote ref for review — on failure
+    # too, so partial work can be salvaged.
+    acquire_repo_lock "$REPO_ID"
+    if git -C "$MAIN" fetch origin "+refs/heads/$remote_branch:refs/remotes/fanout/$SID/$phase"; then
+      printf 'remote_branch=%s\nremote_ref=%s\nremote_base=%s\n' \
+        "$remote_branch" "refs/remotes/fanout/$SID/$phase" "$(read_file "$LANE_DIR/remote-base")"
+    else
+      printf 'remote_branch=%s\nremote_fetch=failed\n' "$remote_branch"
+    fi
+    release_repo_lock
+  fi
   if [[ -n "$result" && -f "$result" ]]; then printf '\n'; cat "$result"; fi
 }
 
@@ -596,10 +639,19 @@ cmd_cleanup() {
       phase=$(basename "$lane"); resolve_lane "$phase"; branch=$(read_file "$lane/branch")
       git -C "$MAIN" worktree remove "$LANE_WORKTREE" --force 2>/dev/null || true
       git -C "$MAIN" branch -D "$branch" 2>/dev/null || true
+      local rb
+      rb=$(read_file "$lane/remote-branch")
+      if [[ -n "$rb" ]]; then
+        git -C "$MAIN" push origin --delete "$rb" >/dev/null 2>&1 || true
+        git -C "$MAIN" update-ref -d "refs/remotes/fanout/$SID/$phase" 2>/dev/null || true
+      fi
     done < <(find "$RUN_DIR/lanes" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
     branch=$(read_file "$RUN_DIR/integration-branch")
     git -C "$MAIN" worktree remove "$INT" --force 2>/dev/null || true
     git -C "$MAIN" branch -D "$branch" 2>/dev/null || true
+    if [[ -n "$(read_file "$RUN_DIR/pushed-int")" ]]; then
+      git -C "$MAIN" push origin --delete "$branch" >/dev/null 2>&1 || true
+    fi
     git -C "$MAIN" worktree prune
     release_repo_lock
   fi

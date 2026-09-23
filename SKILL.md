@@ -1,6 +1,6 @@
 ---
 name: agent-fanout
-description: Delegate implementation work to parallel headless agent-CLI subagents (codex by default; omp with a cheap model like Gemini Flash as an alternative) in persistent git worktrees, with the current agent as orchestrator (plan, review, merge, final QA). Use when the user asks to delegate to codex or omp, fan out work to subagents, or parallelize implementation across cheaper agents. Includes durable runner supervision and the recipe for subagents doing their own visual QA via dev-browser.
+description: Delegate implementation work to parallel headless agent-CLI subagents (codex by default; devin locally or on a cloud VM, or omp with a cheap model like Gemini Flash as alternatives) in persistent git worktrees, with the current agent as orchestrator (plan, review, merge, final QA). Use when the user asks to delegate to codex, devin, or omp, fan out work to subagents, or parallelize implementation across cheaper agents. Includes durable runner supervision and the recipe for subagents doing their own visual QA via dev-browser.
 ---
 
 # Agent fan-out delegation
@@ -37,6 +37,8 @@ ordinary status, logs, and collection cannot explain a lane.
 | Runner | Use | Sandbox |
 |---|---|---|
 | `codex` (default) | substantial phases needing judgment | workspace-write seatbelt |
+| `devin` | local Devin CLI lanes (`devin -p`) | macOS seatbelt/Linux bwrap via `--sandbox` |
+| `devin-cloud` | heavyweight or browser phases on a Devin cloud VM | the VM itself; nothing local is exposed |
 | `omp` | mechanical/template phases, high-volume cheap work | none—full user permissions |
 | `command` | testing or another headless CLI | whatever the command provides |
 
@@ -44,6 +46,26 @@ Codex lanes always run through the bundled progress watchdog. It enables
 workspace-write network access by default, disables headless clarification
 prompts, watches child-bound JSON/worktree/result progress, and fails dead or
 quiet lanes with durable diagnostics.
+
+Devin lanes run `devin -p` under the same watchdog, using worktree diffs,
+transcript export growth, and the child's own CLI log as progress signals. They
+run `--sandbox` with the autonomous permission mode: shell commands are confined
+to the worktree, but the `edit`/`write` file tools are always denied headlessly,
+so the launcher prepends a preamble directing all file changes through `exec`
+shell commands. Do not request write-tool edits in devin briefs.
+
+`devin-cloud` lanes run `devin --cloud -p`: the CLI relays to a Devin cloud
+session that does the work in a VM and pushes a lane branch to `origin`. There
+is no local diff while the lane runs. `start` pushes `int-<run>` to `origin`
+first, and the launcher briefs the session to branch `fanout-<run>-<phase>` off
+it and push back. `collect` fetches that branch to
+`refs/remotes/fanout/<run>/<phase>`; review it with
+`git -C <int> diff int-<run>...refs/remotes/fanout/<run>/<phase>` and merge the
+ref after review. Requirements: the repo needs an `origin` remote the Devin
+account's GitHub integration can push to (403 otherwise — verify with a probe
+branch before a big run), cloud sessions bill ACUs, and `--model` is ignored by
+the cloud relay. Cancelling kills the relay; the orphaned cloud session
+suspends on its own.
 
 OMP uses `--auto-approve`, so scope its brief tightly. It needs one-time auth
 (`omp` then `/login`) or a provider key such as `GEMINI_API_KEY`.
@@ -225,6 +247,18 @@ $AF start --run <run-id> --phase <phase> --brief <brief-file> \
   --runner omp --model gemini-3.5-flash --thinking low
 ```
 
+Local Devin (optionally `--model <model>`):
+
+```bash
+$AF start --run <run-id> --phase <phase> --brief <brief-file> --runner devin
+```
+
+Cloud Devin:
+
+```bash
+$AF start --run <run-id> --phase <phase> --brief <brief-file> --runner devin-cloud
+```
+
 Another headless command:
 
 ```bash
@@ -281,6 +315,15 @@ git -C <lane-worktree> add -A
 git -C <lane-worktree> diff --cached > <run-namespaced-patch>
 ```
 
+For `devin-cloud` lanes the worktree is only an anchor: `collect` fetches the
+pushed branch to `refs/remotes/fanout/<run>/<phase>` and prints it as
+`remote_ref`. Review and merge that ref:
+
+```bash
+git -C <integration-worktree> diff int-<run>...refs/remotes/fanout/<run>/<phase>
+git -C <integration-worktree> merge refs/remotes/fanout/<run>/<phase>
+```
+
 Read every hunk and the runner report. A plain `git diff` is insufficient
 because it omits untracked new files.
 
@@ -320,7 +363,10 @@ $AF cleanup --run <run-id> --drop-worktrees --force
 
 `--force` is an explicit acknowledgment that controller-owned worktrees and
 branches may contain reviewed/staged runner changes. Cleanup is scoped to the
-run and cannot terminate another run's supervisor.
+run and cannot terminate another run's supervisor. With `--drop-worktrees
+--force`, cleanup also deletes the run's remote refs on `origin`
+(`int-<run>` if it was pushed, and each `fanout-<run>-<phase>` lane branch) —
+best-effort, so a missing remote or permission does not fail cleanup.
 
 Durable reports remain in the state directory for diagnosis. Use `list` to
 find known runs:
@@ -338,7 +384,7 @@ configuration does not migrate or delete private stores from existing lanes.
 
 | Symptom | Meaning | Action |
 |---|---|---|
-| `failed`, exit 124 | Codex dead-started or went quiet | inspect result/log/events; relaunch once or take back |
+| `failed`, exit 124 | Codex or Devin dead-started or went quiet | inspect result/log/events; relaunch once or take back |
 | `interrupted` | supervisor/process disappeared without terminal state | inspect worktree; salvage or relaunch explicitly |
 | `running` with no diff | normal analysis/setup unless watchdog later fails it | wait; do not interrupt |
 | browser daemon timeout | daemon was not pre-warmed outside sandbox | pre-warm, then relaunch |

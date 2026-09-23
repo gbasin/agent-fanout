@@ -57,6 +57,13 @@ Callers still budget implementation lanes, API quota, and provider rate limits.
 ## Runners
 
 - `codex` (default): launches `codex exec` through the bundled progress watchdog.
+- `devin`: launches `devin -p` under the same watchdog, in the OS sandbox's
+  autonomous mode. File edits go through `exec` shell commands — the write/edit
+  tools are always denied headlessly.
+- `devin-cloud`: launches `devin --cloud -p` against a Devin cloud VM. The
+  session clones `origin`, branches off the pushed `int-<run>`, and pushes a
+  `fanout-<run>-<phase>` branch back; `collect` fetches it for local review.
+  Requires a Devin account whose GitHub integration can push to the repo.
 - `omp`: launches `omp -p --no-session --auto-approve`; scope briefs tightly
   because it is unsandboxed.
 - `command`: supervises an arbitrary headless command, useful for testing or
@@ -103,6 +110,7 @@ passes the required network flag by default.
 ```bash
 scripts/test-agent-fanout
 scripts/test-launch-codex-lane
+scripts/test-launch-devin-lane
 python3 scripts/test-pnpm-store
 python3 scripts/test-validation
 ```
@@ -127,8 +135,10 @@ loss, and cleanup isolation.
 
 - Git, tmux, Perl, and standard macOS/Linux command-line tools
 - Python 3 for the optional resource and validation helpers
-- At least one authenticated runner: Codex CLI and/or OMP (`omp /login`, or a
-  provider key such as `GEMINI_API_KEY`)
+- At least one authenticated runner: Codex CLI, Devin CLI (`devin auth login`),
+  and/or OMP (`omp /login`, or a provider key such as `GEMINI_API_KEY`)
+- `devin-cloud` lanes additionally need an `origin` remote and a Devin account
+  whose GitHub integration has push access to the repository
 - Optional for visual QA: [dev-browser](https://github.com/gbasin/dev-browser)
 
 See [SKILL.md](SKILL.md) for the complete orchestration and review workflow.
