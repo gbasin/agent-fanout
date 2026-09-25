@@ -280,9 +280,11 @@ $AF collect --run <run-id> --phase <phase>
 Lane states:
 
 ```text
-created → dispatching → running → succeeded | failed | cancelled | interrupted
+initializing → created → dispatching → running → succeeded | failed | cancelled | interrupted
 ```
 
+- `initializing`: `add-lane` claimed the lane but is still creating its
+  worktree. Transient; a later `status` shows `created`.
 - `running`: keep waiting; unchanged worktree is not failure.
 - `succeeded`: inspect the report and complete diff.
 - `failed`: read result/log/events; salvage only complete, correct work.

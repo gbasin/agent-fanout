@@ -118,6 +118,28 @@ RUN_C=$(run_dir run-c)
 [[ -d "$(<"$RUN_B/integration-worktree")" && -d "$(<"$RUN_C/integration-worktree")" ]] \
   || fail "concurrent integration worktrees were not created"
 
+echo "case: init survives a worktree list larger than the pipe buffer"
+FAKEBIN=$TMP/fakebin
+mkdir -p "$FAKEBIN"
+REAL_GIT=$(command -v git)
+cat > "$FAKEBIN/git" <<SHIM
+#!/usr/bin/env bash
+if [[ "\${1:-}" == -C && "\${3:-}" == worktree && "\${4:-}" == list && "\${5:-}" == --porcelain ]]; then
+  "$REAL_GIT" "\$@"
+  i=0
+  while (( i < 4000 )); do
+    printf 'worktree /nonexistent/%s\nHEAD 0000000000000000000000000000000000000000\ndetached\n\n' "\$i"
+    i=\$((i+1))
+  done
+else
+  exec "$REAL_GIT" "\$@"
+fi
+SHIM
+chmod +x "$FAKEBIN/git"
+PATH="$FAKEBIN:$PATH" run_ctl init --repo "$REPO" --sid run-pipe > "$TMP/init-pipe.out"
+[[ -d "$REPO/.worktrees/_int-run-pipe" ]] \
+  || fail "init did not survive a large worktree list"
+
 echo "case: identical phase names coexist across per-run tmux servers"
 run_ctl add-lane --run run-a --phase lane > "$TMP/lane-a.out"
 run_ctl add-lane --run run-b --phase lane > "$TMP/lane-b.out"
@@ -143,6 +165,40 @@ echo "case: human-readable status returns success"
 run_ctl status --run run-a > "$TMP/status.txt"
 assert_file_contains "$TMP/status.txt" $'RUN\tPHASE\tSTATUS\tWORKTREE'
 assert_file_contains "$TMP/status.txt" $'run-a\tlane\tsucceeded\t'
+
+echo "case: status reports a lane whose metadata is still being published"
+LANES_B=$RUN_B/lanes
+mkdir "$LANES_B/initializing"
+run_ctl status --run run-b --json > "$TMP/status-init.json"
+perl -MJSON::PP -0777 -e '
+  $v=decode_json(<>);
+  ($l)=grep { $_->{phase} eq "initializing" } @{$v->{lanes}};
+  die unless $l && $l->{status} eq "initializing";
+' < "$TMP/status-init.json"
+run_ctl status --run run-b > "$TMP/status-init.txt"
+assert_file_contains "$TMP/status-init.txt" $'run-b\tinitializing\tinitializing\t'
+if run_ctl wait --run run-b --phase initializing --timeout 1 >/dev/null 2>&1; then
+  fail "wait on an unpublished lane unexpectedly succeeded"
+fi
+# Between the worktree and status writes, status must stay initializing and
+# must not stamp interrupted on the new lane.
+printf '%s\n' "$REPO/.worktrees/wt-run-b-initializing" > "$LANES_B/initializing/worktree"
+run_ctl status --run run-b --json > "$TMP/status-init2.json"
+perl -MJSON::PP -0777 -e '
+  $v=decode_json(<>);
+  ($l)=grep { $_->{phase} eq "initializing" } @{$v->{lanes}};
+  die unless $l && $l->{status} eq "initializing";
+' < "$TMP/status-init2.json"
+[[ ! -f "$LANES_B/initializing/status" ]] \
+  || fail "status stamped '$(<"$LANES_B/initializing/status")' on a lane still being created"
+printf 'created\n' > "$LANES_B/initializing/status"
+run_ctl status --run run-b --json > "$TMP/status-init3.json"
+perl -MJSON::PP -0777 -e '
+  $v=decode_json(<>);
+  ($l)=grep { $_->{phase} eq "initializing" } @{$v->{lanes}};
+  die unless $l && $l->{status} eq "created";
+' < "$TMP/status-init3.json"
+rm -rf "$LANES_B/initializing"
 
 echo "case: failed child exit is durable after tmux session disappears"
 run_ctl add-lane --run run-a --phase failing >/dev/null
@@ -181,6 +237,7 @@ run_ctl cleanup --run run-a --drop-worktrees --force >/dev/null
 
 run_ctl cleanup --run run-b --drop-worktrees --force >/dev/null
 run_ctl cleanup --run run-c --drop-worktrees --force >/dev/null
+run_ctl cleanup --run run-pipe --drop-worktrees --force >/dev/null
 git -C "$REPO" worktree remove "$CALLER" --force
 git -C "$REPO" branch -D caller >/dev/null
 
