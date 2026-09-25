@@ -74,8 +74,10 @@ canonical_repo() {
   git -C "$from" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || die "not inside a git worktree: $from"
   CURRENT=$(git -C "$from" rev-parse --show-toplevel)
+  # awk must drain stdin rather than exit early: with pipefail, an early exit
+  # SIGPIPEs git when the porcelain list exceeds the pipe buffer.
   MAIN=$(git -C "$from" worktree list --porcelain \
-    | awk 'NR==1{sub(/^worktree /,""); print; exit}')
+    | awk 'NR==1{sub(/^worktree /,""); print}')
   [[ -n "$MAIN" && -d "$MAIN" ]] || die "could not locate primary worktree"
   COMMON_DIR=$(git -C "$from" rev-parse --path-format=absolute --git-common-dir 2>/dev/null \
     || (cd "$from" && cd "$(git rev-parse --git-common-dir)" && pwd -P))
@@ -190,7 +192,11 @@ refresh_lane() {
   pid_matches_start "$wrapper" "$LANE_DIR/wrapper.start" && return 0
   sleep 0.1
   status=$(read_file "$LANE_DIR/status")
-  is_terminal "$status" || atomic_write "$LANE_DIR/status" interrupted
+  # Only a recorded live status can become interrupted. An absent status file
+  # means add-lane is still publishing the lane's metadata, not a lost runner.
+  if [[ -n "$status" ]] && ! is_terminal "$status"; then
+    atomic_write "$LANE_DIR/status" interrupted
+  fi
 }
 
 cmd_init() {
@@ -243,7 +249,7 @@ cmd_init() {
     git -C "$MAIN" fetch --prune origin
     if [[ -z "$base_ref" ]]; then
       base_ref=$(git -C "$MAIN" ls-remote --symref origin HEAD \
-        | awk '$1=="ref:"{sub("^refs/heads/","",$2); print "origin/" $2; exit}')
+        | awk '!seen && $1=="ref:"{sub("^refs/heads/","",$2); print "origin/" $2; seen=1}')
       [[ -n "$base_ref" ]] || base_ref=$(git -C "$MAIN" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
     fi
     [[ -n "$base_ref" ]] || die "no origin default branch; pass --base-ref"
@@ -411,9 +417,18 @@ emit_status() {
   fi
   while IFS= read -r lane; do
     phase=$(basename "$lane")
-    refresh_lane "$phase"
     status=$(read_file "$lane/status")
     wt=$(read_file "$lane/worktree")
+    if [[ -z "$wt" || -z "$status" ]]; then
+      # add-lane claims the lane directory before git worktree add finishes and
+      # its metadata is published. Report the in-flight lane rather than dying
+      # mid-enumeration and truncating the output.
+      status=initializing
+      wt=
+    else
+      refresh_lane "$phase"
+      status=$(read_file "$lane/status")
+    fi
     result=$(read_file "$lane/result")
     log=$(read_file "$lane/run-log")
     if (( json )); then
